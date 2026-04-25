@@ -1,0 +1,5 @@
+build/
+metamodule-plugins/
+metamodule-plugin-sdk/
+*.mmplugin
+.DS_Store
