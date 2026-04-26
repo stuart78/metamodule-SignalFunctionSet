@@ -50,6 +50,13 @@ struct Tine : Module {
 	float smoothMu = 3500.f;
 	int coeffUpdateCounter = 0;
 
+	// Cached smoothing alphas. These are functions only of sampleRate (via
+	// args.sampleTime) and the time constants below, so we recompute them
+	// only when sampleRate changes — not per sample.
+	float cachedSampleRate = 0.f;
+	float smoothAlpha = 0.f;     // for freq/mu smoothing (5ms time constant)
+	double coeffAlpha = 0.0;     // for filter-coeff smoothing (2ms time constant)
+
 	Tine() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 
@@ -155,8 +162,14 @@ struct Tine : Module {
 		// 0→µ=2 (dead thump), 0.5→µ≈50, 0.75→µ≈500, 1.0→µ=50000
 		float mu = 2.f * std::pow(50000.f / 2.f, dampKnob);
 
+		// --- Smoothing alpha cache (only recomputed if sampleRate changes) ---
+		if (args.sampleRate != cachedSampleRate) {
+			cachedSampleRate = args.sampleRate;
+			smoothAlpha = 1.f - std::exp(-args.sampleTime / 0.005f);
+			coeffAlpha  = 1.0 - std::exp(-(double)args.sampleTime / 0.002);
+		}
+
 		// --- Smooth parameters ---
-		float smoothAlpha = 1.f - std::exp(-args.sampleTime / 0.005f);
 		smoothFreq += (freq - smoothFreq) * smoothAlpha;
 		smoothMu += (mu - smoothMu) * smoothAlpha;
 
@@ -167,7 +180,6 @@ struct Tine : Module {
 		}
 
 		// --- Interpolate coefficients toward target ---
-		double coeffAlpha = 1.0 - std::exp(-(double)args.sampleTime / 0.002);
 		for (int i = 0; i < 4; i++) {
 			b[i] += (bTarget[i] - b[i]) * coeffAlpha;
 			a[i] += (aTarget[i] - a[i]) * coeffAlpha;

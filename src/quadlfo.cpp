@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 
 
 struct Drift : Module {
@@ -107,7 +108,7 @@ struct Drift : Module {
 		// Generate base waveforms - all bipolar ±1, perfectly phase-aligned
 		// All waveforms start at 0 when phase=0
 		
-		float sine = std::sin(phase * 2.f * M_PI);
+		float sine = sfs_lut::sine(phase);
 		
 		// Triangle wave: starts at 0, goes to +1 at 0.25, back to 0 at 0.5, to -1 at 0.75, back to 0 at 1.0
 		float triangle;
@@ -127,9 +128,10 @@ struct Drift : Module {
 			sawtooth = 2.f * phase - 2.f; // -1 to 0 (after jump from +1 to -1)
 		}
 		
-		// Square wave: special handling to start at 0 and maintain symmetry
-		// Use a sine-based approach for smooth transitions that starts at 0
-		float square = (std::sin(phase * 2.f * M_PI) >= 0.f) ? 1.f : -1.f;
+		// Square wave. Original called std::sin just to take its sign — we
+		// can do the same thing with a phase compare (sin(2π·phase) ≥ 0
+		// iff phase ∈ [0, 0.5]).
+		float square = (phase < 0.5f) ? 1.f : -1.f;
 		// Override the exact phase=0 case to ensure it starts at 0
 		if (phase < 0.001f || phase > 0.999f) {
 			square = 0.f;
@@ -284,8 +286,11 @@ struct Drift : Module {
 				// Generate the wave with all modulations
 				wave = generateWave(freqModulatedPhase, shape, i, args.sampleTime) * ampMod;
 				
-				// Add subtle harmonic content based on Lorenz Z
-				float harmonicContent = std::sin(freqModulatedPhase * 3.f * M_PI) * lorenzZ * instabilityAmount * 0.1f;
+				// Add subtle harmonic content based on Lorenz Z.
+				// Original was sin(freqModulatedPhase * 3π) — i.e. sin at 1.5x
+				// the period. sfs_lut::sine takes phase in [0,1]=2π, so
+				// freqModulatedPhase * 3π / 2π = freqModulatedPhase * 1.5.
+				float harmonicContent = sfs_lut::sine(freqModulatedPhase * 1.5f) * lorenzZ * instabilityAmount * 0.1f;
 				wave += harmonicContent;
 			}
 

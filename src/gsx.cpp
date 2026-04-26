@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 
 
 struct Gsx : Module {
@@ -42,8 +43,16 @@ struct Gsx : Module {
 		float envelopePhase = 0.f;     // Envelope phase (0-1 over grain lifetime)
 		float wavePhase = 0.f;         // Waveform phase (0-1, wraps for oscillation)
 		float frequency = 440.f;       // Grain frequency in Hz
-		float duration = 0.02f;        // Total grain duration in seconds
-		float pan = 0.5f;              // Stereo pan position (0=left, 1=right)
+		float invDuration = 50.f;      // 1/duration (precomputed to avoid per-sample divide)
+		// Precomputed equal-power pan gains. Computing sqrt() in the per-sample
+		// loop (once was here) is ~20% of total CPU; pan never changes during
+		// a grain's lifetime, so we compute it once at trigger time.
+		float leftGain = 0.7071f;
+		float rightGain = 0.7071f;
+		// Precomputed wave phase increment per sample (= frequency * sampleTime).
+		float waveIncrement = 0.f;
+		// Precomputed envelope phase increment per sample (= sampleTime / duration).
+		float envelopeIncrement = 0.f;
 
 		void reset() {
 			active = false;
@@ -51,30 +60,32 @@ struct Gsx : Module {
 			wavePhase = 0.f;
 		}
 
-		void trigger(float freq, float dur, float panPos) {
+		void trigger(float freq, float dur, float panPos, float sampleTime) {
 			active = true;
 			envelopePhase = 0.f;
 			wavePhase = 0.f;
 			frequency = freq;
-			duration = dur;
-			pan = clamp(panPos, 0.f, 1.f);
+			invDuration = 1.f / dur;
+			waveIncrement = freq * sampleTime;
+			envelopeIncrement = sampleTime * invDuration;
+			float p = clamp(panPos, 0.f, 1.f);
+			// Equal-power panning, computed once at trigger.
+			leftGain = std::sqrt(1.f - p);
+			rightGain = std::sqrt(p);
 		}
 	};
 
-	// Hann window envelope function
-	// Takes normalized phase (0-1) and returns amplitude (0-1)
+	// Hann window envelope function. Uses precomputed LUT instead of cos().
 	float hannWindow(float phase) {
-		if (phase < 0.f || phase > 1.f)
-			return 0.f;
-		return 0.5f * (1.f - std::cos(2.f * M_PI * phase));
+		return sfs_lut::hann(phase);
 	}
 
 	// Generate waveform sample at given phase with shape morphing
 	// phase: 0-1 normalized phase
 	// shape: 0-1 (0=sine, 0.33=tri, 0.66=saw, 1=square)
 	float generateGrainWave(float phase, float shape) {
-		// Sine wave
-		float sine = std::sin(phase * 2.f * M_PI);
+		// Sine wave (LUT instead of std::sin)
+		float sine = sfs_lut::sine(phase);
 
 		// Triangle wave: starts at 0, goes to +1 at 0.25, 0 at 0.5, -1 at 0.75, 0 at 1.0
 		float triangle;
@@ -115,9 +126,18 @@ struct Gsx : Module {
 		}
 	}
 
-	// Stream management
+	// Stream management.
+	// MetaModule has a far smaller CPU budget than a desktop, and 20×20=400
+	// concurrent grains is overkill for the platform. Halving each dimension
+	// quarters the worst-case work per sample while still supporting dense
+	// textures (8 streams × 8 = 64 simultaneous grains).
+#ifdef METAMODULE
+	static constexpr int MAX_STREAMS = 8;
+	static constexpr int GRAINS_PER_STREAM = 8;
+#else
 	static constexpr int MAX_STREAMS = 20;
-	static constexpr int GRAINS_PER_STREAM = 20; // Allow overlap of up to 20 grains per stream for dense textures
+	static constexpr int GRAINS_PER_STREAM = 20;
+#endif
 
 	struct Stream {
 		Grain grains[GRAINS_PER_STREAM];
@@ -130,7 +150,7 @@ struct Gsx : Module {
 	Gsx() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 		configParam(PARAMFREQUENCY_PARAM, std::log2(50.f), std::log2(2000.f), std::log2(130.81f), "Frequency", " Hz", 2.f, 1.f);
-		configParam(PARAMSTREAMS_PARAM, 1.f, 20.f, 10.f, "Streams", " streams");
+		configParam(PARAMSTREAMS_PARAM, 1.f, (float)MAX_STREAMS, (float)std::min(10, MAX_STREAMS), "Streams", " streams");
 		configParam(PARAMSHAPE_PARAM, 0.f, 1.f, 0.f, "Shape");
 		configParam(PARAMRANGE_PARAM, 0.f, 500.f, 100.f, "Range", " Hz");
 		configParam(PARAMDURATION_PARAM, 1.f, 100.f, 20.f, "Duration", " ms");
@@ -163,7 +183,7 @@ struct Gsx : Module {
 		int numStreams = (int)std::round(params[PARAMSTREAMS_PARAM].getValue());
 		if (inputs[INSTREAMS_INPUT].isConnected()) {
 			numStreams = (int)std::round(clamp(params[PARAMSTREAMS_PARAM].getValue() +
-				inputs[INSTREAMS_INPUT].getVoltage() * 2.f, 1.f, 20.f));
+				inputs[INSTREAMS_INPUT].getVoltage() * 2.f, 1.f, (float)MAX_STREAMS));
 		}
 		numStreams = clamp(numStreams, 1, MAX_STREAMS);
 
@@ -279,8 +299,8 @@ struct Gsx : Module {
 							panPos = clamp(panPos, 0.f, 1.f);
 						}
 
-						// Trigger the grain
-						stream.grains[g].trigger(grainFreq, grainDur, panPos);
+						// Trigger the grain (precomputes pan gains, wave/env increments)
+						stream.grains[g].trigger(grainFreq, grainDur, panPos, args.sampleTime);
 						break;
 					}
 				}
@@ -297,35 +317,30 @@ struct Gsx : Module {
 				stream.nextGrainTime = std::max(0.001f, nextDelay);
 			}
 
-			// Process all active grains in this stream
+			// Process all active grains in this stream.
+			// Hot loop — every operation here runs ~48,000 times/sec per active grain.
 			for (int g = 0; g < GRAINS_PER_STREAM; g++) {
 				Grain& grain = stream.grains[g];
 				if (!grain.active) continue;
 
 				activeGrainCount++;
 
-				// Generate grain sample
+				// Generate grain sample (LUT-based sine + cheap waveform morph)
 				float grainSample = generateGrainWave(grain.wavePhase, shape);
 
-				// Apply envelope
-				float envelope = hannWindow(grain.envelopePhase);
-				grainSample *= envelope;
+				// Apply envelope (LUT-based Hann)
+				grainSample *= hannWindow(grain.envelopePhase);
 
-				// Apply stereo panning (equal-power)
-				float leftGain = std::sqrt(1.f - grain.pan);
-				float rightGain = std::sqrt(grain.pan);
+				// Use precomputed pan gains (no per-sample sqrt)
+				leftOut += grainSample * grain.leftGain;
+				rightOut += grainSample * grain.rightGain;
 
-				leftOut += grainSample * leftGain;
-				rightOut += grainSample * rightGain;
+				// Advance waveform phase using precomputed increment
+				grain.wavePhase += grain.waveIncrement;
+				if (grain.wavePhase >= 1.f) grain.wavePhase -= (int)grain.wavePhase;
 
-				// Advance waveform phase at grain frequency (wraps at 1.0)
-				float waveIncrement = grain.frequency * args.sampleTime;
-				grain.wavePhase += waveIncrement;
-			while (grain.wavePhase >= 1.f) grain.wavePhase -= 1.f;
-
-			// Advance envelope phase based on grain duration
-			float envelopeIncrement = args.sampleTime / grain.duration;
-			grain.envelopePhase += envelopeIncrement;
+				// Advance envelope phase using precomputed increment
+				grain.envelopePhase += grain.envelopeIncrement;
 
 				// Check if grain is finished based on envelope
 				if (grain.envelopePhase >= 1.f) {

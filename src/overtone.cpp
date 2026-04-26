@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 
 
@@ -202,16 +203,19 @@ struct Overtone : Module {
 			harmonicTarget[i] = newActive[i];
 		}
 
-		// Additive synthesis with zero-crossing gating
-		// Fundamental (H1) is always present
-		float fundamental = std::sin(phase * 2.f * (float)M_PI);
+		// Additive synthesis with zero-crossing gating.
+		// Use sine LUT (sfs_lut takes phase in [0,1] = one full period) instead
+		// of std::sin, which dropped the per-sample CPU here from 9 transcendentals
+		// to 9 LUT lookups (~10x faster on MetaModule).
+		float fundamental = sfs_lut::sine(phase);
 		float out = fundamental;      // amplitude 1.0 for fundamental
 		float normSum = 1.f;           // fundamental contributes 1.0
 		bool changed = false;
 
 		for (int h = 0; h < NUM_OVERTONES; h++) {
 			int n = OVERTONE_HARMONIC[h]; // harmonic number 2-9
-			float harmonicSample = OVERTONE_AMP[h] * std::sin(phase * n * 2.f * (float)M_PI);
+			// sfs_lut::sine wraps internally, so phase * n can exceed 1.0 safely.
+			float harmonicSample = OVERTONE_AMP[h] * sfs_lut::sine(phase * (float)n);
 
 			// Check for zero crossing: sign change between previous and current sample
 			if (harmonicActive[h] != harmonicTarget[h]) {

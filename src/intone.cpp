@@ -1,9 +1,18 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 
 
 static const int NUM_FORMANTS = 5;
-static const int GRAINS_PER_FORMANT = 8;  // overlapping FOFs per formant
+// Overlapping FOFs per formant. On MetaModule the per-sample CPU cost of
+// dozens of simultaneous damped sinusoids is significant, so we halve the
+// pool. With 5 formants * 4 grains = 20 max active grains it can still
+// produce smooth attacks for typical f0 rates.
+#ifdef METAMODULE
+static const int GRAINS_PER_FORMANT = 4;
+#else
+static const int GRAINS_PER_FORMANT = 8;
+#endif
 static const int DISPLAY_BINS = 256;       // spectrum display resolution
 
 // Vowel preset table: F1-F5 frequencies in Hz for /a/, /e/, /i/, /o/, /u/
@@ -21,49 +30,67 @@ static const float DEFAULT_AMPS[NUM_FORMANTS] = { 1.0f, 0.8f, 0.5f, 0.3f, 0.2f }
 
 
 // One FOF grain — a damped sinusoid triggered at a moment in time.
+//
+// Per-sample math is the hot path: with 5 formants × N grains × 48kHz,
+// we go through this `tick()` millions of times per second. The original
+// implementation called std::sin / std::cos / std::exp per grain per
+// sample. We now use:
+//   - phase accumulators (no sin/cos with growing argument)
+//   - a sine LUT for the oscillator and the cos attack window
+//   - a precomputed dampPerSample = exp(-alpha) (constant for grain lifetime)
+//   - the built-in Hann LUT for the half-cosine attack ramp
 struct FOFGrain {
 	bool active = false;
 	int k = 0;              // samples since trigger
-	int attackSamples = 0;  // π/β duration of cosine smoothing window
-	float omega = 0.f;      // angular frequency per sample (radians)
-	float alpha = 0.f;      // exponential damping per sample
-	float beta = 0.f;       // attack rate (radians per sample)
+	int attackSamples = 0;  // attack window length (samples)
+	float invAttackSamples = 0.f; // 1 / attackSamples, for fast normalization
+	float oscPhase = 0.f;   // sine oscillator phase, 0..1, increments by oscInc/sample
+	float oscInc = 0.f;     // = omega / (2π) — frequency in cycles/sample
 	float amplitude = 0.f;
-	float envelope = 1.f;   // current decay envelope value (running e^(-αk))
+	float envelope = 1.f;   // current decay envelope (running e^(-αk))
+	float dampPerSample = 1.f; // = exp(-alpha), precomputed once at trigger
 
 	void trigger(float w, float a, float b, float amp) {
 		k = 0;
-		omega = w;
-		alpha = a;
-		beta = b;
+		oscPhase = 0.f;
+		// Phase increment per sample = ω / (2π) = freq * sampleTime
+		oscInc = w * (1.f / (2.f * (float)M_PI));
 		amplitude = amp;
 		envelope = 1.f;
+		// exp(-alpha) is invariant for the grain's lifetime — compute it once.
+		dampPerSample = std::exp(-a);
 		// attackSamples = π/β (when β > 0); cap to reasonable max
 		attackSamples = (b > 0.f) ? (int)(M_PI / b) : 64;
 		if (attackSamples > 2048) attackSamples = 2048;
 		if (attackSamples < 4) attackSamples = 4;
+		invAttackSamples = 1.f / (float)attackSamples;
 		active = true;
 	}
 
 	float tick() {
 		if (!active) return 0.f;
 
-		// Sinusoid component
-		float s = std::sin(omega * (float)k);
+		// Sinusoid (LUT, no per-sample std::sin)
+		float s = sfs_lut::sine(oscPhase);
 
-		// Envelope: cosine attack window then exponential decay
+		// Attack window via Hann LUT.
+		// Original was 0.5 * (1 - cos(β*k)) which equals hann(k/attackSamples)
+		// because attackSamples = π/β (so β*k goes from 0 to π over attack).
+		// Hann LUT covers 0..1 with full period; we want first half of cosine
+		// (0 to π), so map k/attackSamples to phase in [0, 0.5] of the Hann LUT.
 		float env;
 		if (k < attackSamples) {
-			env = 0.5f * (1.f - std::cos(beta * (float)k));
+			env = sfs_lut::hann(0.5f * (float)k * invAttackSamples);
 		} else {
 			env = 1.f;
 		}
-		// Apply exponential damping (running multiplier)
 		float out = amplitude * envelope * env * s;
 
-		// Update state
+		// Advance phase + envelope
+		oscPhase += oscInc;
+		if (oscPhase >= 1.f) oscPhase -= (int)oscPhase;
 		k++;
-		envelope *= std::exp(-alpha);
+		envelope *= dampPerSample;  // no per-sample std::exp
 
 		// Deactivate when envelope is very small
 		if (envelope < 1e-5f && k > attackSamples) {
