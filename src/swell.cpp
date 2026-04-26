@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 
 
@@ -142,8 +143,11 @@ struct Swell : Module {
 		float curve  = readParamCV(params[CURVE_PARAM], inputs[CURVE_CV_INPUT]);
 
 		float delta     = deltaN * 10.f;
-		float riseTime  = std::max(0.001f * std::pow(2000.f, riseN), 0.001f);
-		float decayTime = std::max(0.01f  * std::pow(1000.f, decN),  0.001f);
+		// pow(a, k) = pow2(k * log2(a))
+		static constexpr float LOG2_2000 = 10.965784f;
+		static constexpr float LOG2_1000 = 9.965784f;
+		float riseTime  = std::max(0.001f * sfs_lut::pow2(riseN * LOG2_2000), 0.001f);
+		float decayTime = std::max(0.01f  * sfs_lut::pow2(decN  * LOG2_1000), 0.001f);
 
 		dispCurve     = curve;
 		dispRiseTime  = riseTime;

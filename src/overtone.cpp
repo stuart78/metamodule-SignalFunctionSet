@@ -142,7 +142,7 @@ struct Overtone : Module {
 		float pitch = params[FREQ_PARAM].getValue();
 		if (inputs[VOCT_INPUT].isConnected())
 			pitch += inputs[VOCT_INPUT].getVoltage();
-		float freq = dsp::FREQ_C4 * std::pow(2.f, pitch);
+		float freq = dsp::FREQ_C4 * sfs_lut::pow2(pitch);
 		freq = clamp(freq, 8.f, 20000.f);
 
 		// Phase accumulation

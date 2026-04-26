@@ -277,6 +277,22 @@ struct Intone : Module {
 		       VOWEL_FREQS[idx + 1][formantIdx] * frac;
 	}
 
+	// Faster: decodes vowelPos once and fills all NUM_FORMANTS frequencies.
+	// Saves ~4 redundant index decodes per sample vs calling vowelFreq() in a loop.
+	void vowelFreqs(float vowelPos, float out[NUM_FORMANTS]) {
+		float scaled = vowelPos * 4.f;
+		int idx = (int)scaled;
+		if (idx >= 4) {
+			for (int i = 0; i < NUM_FORMANTS; i++) out[i] = VOWEL_FREQS[4][i];
+			return;
+		}
+		float frac = scaled - (float)idx;
+		float invFrac = 1.f - frac;
+		for (int i = 0; i < NUM_FORMANTS; i++) {
+			out[i] = VOWEL_FREQS[idx][i] * invFrac + VOWEL_FREQS[idx + 1][i] * frac;
+		}
+	}
+
 	void process(const ProcessArgs& args) override {
 		// Read mode
 		bool modeSwitchTrigger = params[MODE_PARAM].getValue() > 0.5f;
@@ -313,11 +329,11 @@ struct Intone : Module {
 		float f0;
 		float formantTransposeRatio = 1.f;
 		if (defaultMode) {
-			f0 = dsp::FREQ_C4 * std::pow(2.f, voct);
+			f0 = dsp::FREQ_C4 * sfs_lut::pow2(voct);
 			f0 = clamp(f0, 8.f, 4000.f);
 		} else {
 			f0 = dsp::FREQ_C4; // not used in audio/trigger modes
-			formantTransposeRatio = std::pow(2.f, voct);
+			formantTransposeRatio = sfs_lut::pow2(voct);
 		}
 
 		// Compute per-formant parameters
@@ -325,15 +341,19 @@ struct Intone : Module {
 		float formantBWs[NUM_FORMANTS];
 		float formantAmps[NUM_FORMANTS];
 
+		// Decode vowel position once (used for all 5 formants)
+		float baseFreqs[NUM_FORMANTS];
+		vowelFreqs(vowelPos, baseFreqs);
+
 		for (int i = 0; i < NUM_FORMANTS; i++) {
-			// Base frequency from vowel morph
-			float baseFreq = vowelFreq(i, vowelPos);
+			float baseFreq = baseFreqs[i];
 			// Manual offset (±1 octave)
 			float offset = params[F1_FREQ_PARAM + i].getValue();
 			if (inputs[F1_FREQ_CV + i].isConnected())
 				offset += inputs[F1_FREQ_CV + i].getVoltage() / 5.f;
 			offset = clamp(offset, -1.f, 1.f);
-			float freq = baseFreq * std::pow(2.f, offset) * formantTransposeRatio;
+			// 5x per sample — LUT pow2 saves ~5 std::pow calls per sample.
+			float freq = baseFreq * sfs_lut::pow2(offset) * formantTransposeRatio;
 			freq = clamp(freq, 30.f, 8000.f);
 			formantFreqs[i] = freq;
 

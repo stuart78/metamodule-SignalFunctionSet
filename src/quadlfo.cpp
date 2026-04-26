@@ -177,7 +177,7 @@ struct Drift : Module {
 		stability = clamp(stability, 0.f, 1.f);
 
 		float freq = params[PARAMFREQUENCY_PARAM].getValue();
-		float actualFreq = std::pow(2.f, freq);
+		float actualFreq = sfs_lut::pow2(freq);
 		
 		// Handle clock input
 		clockConnected = inputs[INFREQUENCY_INPUT].isConnected();

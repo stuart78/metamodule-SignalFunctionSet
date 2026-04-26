@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 
 
@@ -151,7 +152,7 @@ struct Tine : Module {
 		float pitch = params[FREQ_PARAM].getValue();
 		if (inputs[VOCT_INPUT].isConnected())
 			pitch += inputs[VOCT_INPUT].getVoltage();
-		float freq = dsp::FREQ_C4 * std::pow(2.f, pitch);
+		float freq = dsp::FREQ_C4 * sfs_lut::pow2(pitch);
 		freq = clamp(freq, 8.f, std::min(20000.f, args.sampleRate * 0.45f));
 
 		// --- Damping (µ) ---
@@ -160,7 +161,9 @@ struct Tine : Module {
 			dampKnob += inputs[DAMPING_CV_INPUT].getVoltage() / 5.f;
 		dampKnob = clamp(dampKnob, 0.f, 1.f);
 		// 0→µ=2 (dead thump), 0.5→µ≈50, 0.75→µ≈500, 1.0→µ=50000
-		float mu = 2.f * std::pow(50000.f / 2.f, dampKnob);
+		// pow(25000, k) = pow2(k * log2(25000)). log2(25000) precomputed below.
+		static constexpr float LOG2_25000 = 14.6096405f;
+		float mu = 2.f * sfs_lut::pow2(dampKnob * LOG2_25000);
 
 		// --- Smoothing alpha cache (only recomputed if sampleRate changes) ---
 		if (args.sampleRate != cachedSampleRate) {

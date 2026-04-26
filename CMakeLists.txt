@@ -13,10 +13,15 @@ endif()
 include(${METAMODULE_SDK_DIR}/plugin.cmake)
 
 project(SignalFunctionSet
-    VERSION 2.3.0
+    VERSION 0.1.2
     DESCRIPTION "Signal Function Set plugin for MetaModule"
     LANGUAGES C CXX ASM
 )
+
+# Override at configure time with -DPLUGIN_VERSION=v0.X.Y if needed
+if(NOT DEFINED PLUGIN_VERSION)
+    set(PLUGIN_VERSION "v${PROJECT_VERSION}")
+endif()
 
 add_library(SignalFunctionSet STATIC)
 
@@ -53,4 +58,15 @@ create_plugin(
     PLUGIN_JSON      ${SOURCE_DIR}/plugin.json
     SOURCE_ASSETS    ${SOURCE_DIR}/assets
     DESTINATION      ${INSTALL_DIR}
+)
+
+# After every build, also produce a properly-named versioned copy
+# (matches the format that the MetaModule plugin scanner / firmware expect:
+#  SignalFunctionSet-v0.1.2.mmplugin)
+add_custom_command(
+    TARGET plugin POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${INSTALL_DIR}/SignalFunctionSet.mmplugin
+        ${INSTALL_DIR}/SignalFunctionSet-${PLUGIN_VERSION}.mmplugin
+    COMMENT "Local deploy: SignalFunctionSet-${PLUGIN_VERSION}.mmplugin"
 )

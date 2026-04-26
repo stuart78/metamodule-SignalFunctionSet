@@ -173,10 +173,10 @@ struct Gsx : Module {
 	}
 
 	void process(const ProcessArgs& args) override {
-		// Read parameters with CV inputs
-		float centerFreq = std::pow(2.f, params[PARAMFREQUENCY_PARAM].getValue());
+		// Read parameters with CV inputs (LUT-based pow2 — was 2 std::pow per sample)
+		float centerFreq = sfs_lut::pow2(params[PARAMFREQUENCY_PARAM].getValue());
 		if (inputs[INFREQUENCY_INPUT].isConnected()) {
-			centerFreq *= std::pow(2.f, inputs[INFREQUENCY_INPUT].getVoltage());
+			centerFreq *= sfs_lut::pow2(inputs[INFREQUENCY_INPUT].getVoltage());
 		}
 		centerFreq = clamp(centerFreq, 50.f, 2000.f);
 
