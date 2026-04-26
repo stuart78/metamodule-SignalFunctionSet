@@ -89,8 +89,14 @@ jobs:
           mkdir -p ${{ github.workspace }}/metamodule-plugins
           cmake -B build -G Ninja -DMETAMODULE_SDK_DIR=${{ github.workspace }}/metamodule-plugin-sdk
           cmake --build build
-          # Add version tag to the plugin file name
-          cd ${{ github.workspace }}/metamodule-plugins && for f in *.mmplugin; do mv $f ${f%.mmplugin}-${{ env.CI_REF_NAME }}.mmplugin; done;
+          # CMake now produces both an unversioned file and a -v$VERSION copy
+          # for local-deploy convenience; the workflow only wants the
+          # workflow-versioned name. Drop the locally-versioned copies first
+          # so the rename below produces a single clean file.
+          cd ${{ github.workspace }}/metamodule-plugins
+          rm -f SignalFunctionSet-v*.mmplugin
+          # Tag the remaining unversioned plugin with the workflow ref name
+          for f in *.mmplugin; do mv "$f" "${f%.mmplugin}-${{ env.CI_REF_NAME }}.mmplugin"; done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
