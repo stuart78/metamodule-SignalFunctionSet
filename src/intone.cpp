@@ -73,14 +73,14 @@ struct FOFGrain {
 		// Sinusoid (LUT, no per-sample std::sin)
 		float s = sfs_lut::sine(oscPhase);
 
-		// Attack window via Hann LUT.
-		// Original was 0.5 * (1 - cos(β*k)) which equals hann(k/attackSamples)
-		// because attackSamples = π/β (so β*k goes from 0 to π over attack).
-		// Hann LUT covers 0..1 with full period; we want first half of cosine
-		// (0 to π), so map k/attackSamples to phase in [0, 0.5] of the Hann LUT.
+		// Attack window: smoothstep approximation of the original Hann curve.
+		// Both are S-shaped 0→1 with zero derivative at endpoints; the audible
+		// difference is below noise floor for typical attack lengths. Saves a
+		// LUT lookup (~10 ops) for ~5 mul/adds per grain per attack-sample.
 		float env;
 		if (k < attackSamples) {
-			env = sfs_lut::hann(0.5f * (float)k * invAttackSamples);
+			float t = (float)k * invAttackSamples; // [0, 1)
+			env = t * t * (3.f - 2.f * t);          // smoothstep
 		} else {
 			env = 1.f;
 		}

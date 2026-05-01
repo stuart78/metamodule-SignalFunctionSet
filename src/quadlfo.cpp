@@ -66,6 +66,17 @@ struct Drift : Module {
 	static constexpr int LORENZ_THROTTLE = 16; // updates ~3kHz at 48kHz
 	int lorenzCounter = 0;
 
+	// Drift is an LFO — max output frequency is ~100Hz (clamp on clock input).
+	// At 48kHz a 100Hz LFO has 480 samples per cycle, so holding the output
+	// for OUTPUT_THROTTLE samples gives 480/4 = 120 updates per cycle — well
+	// above any audible artifact. Wave generation (sine LUT, Lorenz post-
+	// processing, min/max) only runs every Nth sample; phase still advances
+	// every sample so timing is sample-accurate.
+	static constexpr int OUTPUT_THROTTLE = 4;
+	int outputCounter = 0;
+	float heldOutputs[4] = {};
+	float heldMin = 0.f, heldMax = 0.f;
+
 	Drift() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 		configParam(PARAMSHAPE_PARAM, 0.f, 1.f, 0.5f, "Shape", "", 0.f, 1.f);
@@ -233,6 +244,21 @@ struct Drift : Module {
 			}
 		}
 
+		// Throttle wave generation: only recompute outputs every
+		// OUTPUT_THROTTLE samples; in-between samples re-emit the held value.
+		// Phase has already been advanced above (cheap, sample-accurate).
+		if (outputCounter > 0) {
+			outputCounter--;
+			this->outputs[OUTA_OUTPUT].setVoltage(heldOutputs[0]);
+			this->outputs[OUTB_OUTPUT].setVoltage(heldOutputs[1]);
+			this->outputs[OUTC_OUTPUT].setVoltage(heldOutputs[2]);
+			this->outputs[OUTD_OUTPUT].setVoltage(heldOutputs[3]);
+			this->outputs[OUTMIN_OUTPUT].setVoltage(heldMin);
+			this->outputs[OUTMAX_OUTPUT].setVoltage(heldMax);
+			return;
+		}
+		outputCounter = OUTPUT_THROTTLE - 1;
+
 		// Generate outputs
 		float outputs[4];
 		float minVal = 10.f, maxVal = -10.f;
@@ -289,6 +315,14 @@ struct Drift : Module {
 			minVal = std::min(minVal, outputs[i]);
 			maxVal = std::max(maxVal, outputs[i]);
 		}
+
+		// Cache for hold-output samples between throttle ticks
+		heldOutputs[0] = outputs[0];
+		heldOutputs[1] = outputs[1];
+		heldOutputs[2] = outputs[2];
+		heldOutputs[3] = outputs[3];
+		heldMin = minVal;
+		heldMax = maxVal;
 
 		// Set outputs
 		this->outputs[OUTA_OUTPUT].setVoltage(outputs[0]);
