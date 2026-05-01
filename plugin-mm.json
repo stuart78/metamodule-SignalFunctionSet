@@ -3,7 +3,7 @@
   "MetaModulePluginMaintainer": "Stuart Frederich-Smith",
   "MetaModulePluginMaintainerEmail": "hello@signalfunctionset.com",
   "MetaModulePluginMaintainerUrl": "https://signalfunctionset.com/",
-  "MetaModuleDescription": "Port of the Signal Function Set VCV Rack plugin to MetaModule. Includes Drift (LFO with Lorenz chaos), GSX (granular synthesis), Fugue (harmonic deviation sequencer), Phase (dual sample looper), Overtone (additive VCO), Intone (formant synthesis), Tine (pingable resonator), Meter (musical clock), and Swell (ping-driven envelope).",
+  "MetaModuleDescription": "Nine modules covering synthesis voices, sequencers, sample manipulation, and clocks. A complete musical toolkit for patching.",
   "MetaModuleIncludedModules": [
     { "slug": "Drift",    "name": "Drift" },
     { "slug": "gsx",      "name": "GSX" },

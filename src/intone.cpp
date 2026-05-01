@@ -226,6 +226,25 @@ struct Intone : Module {
 	float currentFormantAmp[NUM_FORMANTS] = {};
 	bool displayDirty = true;
 
+	// Cached per-formant params + ancillary state. Param recomputation is
+	// throttled — see comments in process(). These hold the most recent
+	// values so audio paths can read them every sample without recomputing.
+	float cachedFormantFreqs[NUM_FORMANTS] = {};
+	float cachedFormantBWs[NUM_FORMANTS]   = {};
+	float cachedFormantAmps[NUM_FORMANTS]  = {};
+	float cachedF0    = 130.81f;
+	float cachedBeta  = 0.025f;
+	bool cachedDefaultMode = true;
+	bool cachedAudioMode = false;
+	bool cachedTriggerMode = false;
+	bool cachedFormantsChanged = false;
+	int paramThrottleCounter = 0;
+	// Recompute params every N samples. At 48kHz, N=8 gives a 6kHz update
+	// rate — well above any control-rate use, and any audio-rate v/oct
+	// modulation would be heavily lowpassed by the FOF triggers (max f0 =
+	// 4kHz) and biquad smoothing anyway.
+	static constexpr int PARAM_THROTTLE = 8;
+
 	Intone() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 
@@ -294,93 +313,96 @@ struct Intone : Module {
 	}
 
 	void process(const ProcessArgs& args) override {
-		// Read mode
-		bool modeSwitchTrigger = params[MODE_PARAM].getValue() > 0.5f;
-		bool excPatched = inputs[EXC_INPUT].isConnected();
-		// Three effective modes:
-		//   Default (no patch): FOF synth, V/Oct = pitch
-		//   Audio mode (patched + switch up): BPF bank, V/Oct = formant transpose
-		//   Trigger mode (patched + switch down): FOF triggered externally, V/Oct = formant transpose
-		bool audioMode = excPatched && !modeSwitchTrigger;
-		bool triggerMode = excPatched && modeSwitchTrigger;
-		bool defaultMode = !excPatched;
+		// --- Throttled parameter recomputation -----------------------------
+		// All formant params (15 reads, 5 pow2, 5 clamps + display dirty
+		// check) used to run every sample, but the *consumers* run far less
+		// often: FOF mode reads them at f0 trigger events (≤4kHz), audio mode
+		// reads them only when `changed` is true (driven by knob/CV motion),
+		// and the display only refreshes at ~60Hz. Recompute every
+		// PARAM_THROTTLE samples and reuse cached values otherwise.
+		bool recompute = (paramThrottleCounter == 0);
+		if (++paramThrottleCounter >= PARAM_THROTTLE) paramThrottleCounter = 0;
 
-		// V/Oct
-		float voct = inputs[VOCT_INPUT].isConnected() ? inputs[VOCT_INPUT].getVoltage() : 0.f;
+		if (recompute) {
+			// Read mode
+			bool modeSwitchTrigger = params[MODE_PARAM].getValue() > 0.5f;
+			bool excPatched = inputs[EXC_INPUT].isConnected();
+			cachedAudioMode    = excPatched && !modeSwitchTrigger;
+			cachedTriggerMode  = excPatched && modeSwitchTrigger;
+			cachedDefaultMode  = !excPatched;
 
-		// Vowel morph position
-		float vowelPos = params[VOWEL_PARAM].getValue();
-		if (inputs[VOWEL_CV].isConnected())
-			vowelPos += inputs[VOWEL_CV].getVoltage() / 10.f;
-		vowelPos = clamp(vowelPos, 0.f, 1.f);
+			// V/Oct
+			float voct = inputs[VOCT_INPUT].isConnected() ? inputs[VOCT_INPUT].getVoltage() : 0.f;
 
-		// Skirt width: 0 = soft (slow attack), 1 = hard (fast attack)
-		// Maps to beta value — larger beta = faster attack = wider skirts
-		float skirt = params[SKIRT_PARAM].getValue();
-		if (inputs[SKIRT_CV].isConnected())
-			skirt += inputs[SKIRT_CV].getVoltage() / 5.f;
-		skirt = clamp(skirt, 0.f, 1.f);
-		// Map skirt 0-1 to beta range: 0.005 to 0.05 (radians per sample)
-		float beta = 0.005f + skirt * 0.045f;
+			// Vowel morph position
+			float vowelPos = params[VOWEL_PARAM].getValue();
+			if (inputs[VOWEL_CV].isConnected())
+				vowelPos += inputs[VOWEL_CV].getVoltage() / 10.f;
+			vowelPos = clamp(vowelPos, 0.f, 1.f);
 
-		// Compute fundamental frequency and formant transpose ratio.
-		// Only default mode uses V/Oct as pitch — the other two modes use
-		// V/Oct as a formant transposition multiplier.
-		float f0;
-		float formantTransposeRatio = 1.f;
-		if (defaultMode) {
-			f0 = dsp::FREQ_C4 * sfs_lut::pow2(voct);
-			f0 = clamp(f0, 8.f, 4000.f);
-		} else {
-			f0 = dsp::FREQ_C4; // not used in audio/trigger modes
-			formantTransposeRatio = sfs_lut::pow2(voct);
-		}
+			// Skirt width → beta (attack rate, radians per sample)
+			float skirt = params[SKIRT_PARAM].getValue();
+			if (inputs[SKIRT_CV].isConnected())
+				skirt += inputs[SKIRT_CV].getVoltage() / 5.f;
+			skirt = clamp(skirt, 0.f, 1.f);
+			cachedBeta = 0.005f + skirt * 0.045f;
 
-		// Compute per-formant parameters
-		float formantFreqs[NUM_FORMANTS];
-		float formantBWs[NUM_FORMANTS];
-		float formantAmps[NUM_FORMANTS];
-
-		// Decode vowel position once (used for all 5 formants)
-		float baseFreqs[NUM_FORMANTS];
-		vowelFreqs(vowelPos, baseFreqs);
-
-		for (int i = 0; i < NUM_FORMANTS; i++) {
-			float baseFreq = baseFreqs[i];
-			// Manual offset (±1 octave)
-			float offset = params[F1_FREQ_PARAM + i].getValue();
-			if (inputs[F1_FREQ_CV + i].isConnected())
-				offset += inputs[F1_FREQ_CV + i].getVoltage() / 5.f;
-			offset = clamp(offset, -1.f, 1.f);
-			// 5x per sample — LUT pow2 saves ~5 std::pow calls per sample.
-			float freq = baseFreq * sfs_lut::pow2(offset) * formantTransposeRatio;
-			freq = clamp(freq, 30.f, 8000.f);
-			formantFreqs[i] = freq;
-
-			// Bandwidth
-			float bw = params[F1_BW_PARAM + i].getValue();
-			if (inputs[F1_BW_CV + i].isConnected())
-				bw += inputs[F1_BW_CV + i].getVoltage() * 50.f;
-			bw = clamp(bw, 30.f, 500.f);
-			formantBWs[i] = bw;
-
-			// Amplitude
-			formantAmps[i] = params[F1_AMP_PARAM + i].getValue();
-		}
-
-		// Update display cache + dirty flag
-		bool changed = false;
-		for (int i = 0; i < NUM_FORMANTS; i++) {
-			if (std::fabs(currentFormantFreq[i] - formantFreqs[i]) > 0.5f ||
-			    std::fabs(currentFormantBW[i] - formantBWs[i]) > 0.5f ||
-			    std::fabs(currentFormantAmp[i] - formantAmps[i]) > 0.001f) {
-				changed = true;
+			// f0 / formant transpose
+			float formantTransposeRatio = 1.f;
+			if (cachedDefaultMode) {
+				cachedF0 = clamp(dsp::FREQ_C4 * sfs_lut::pow2(voct), 8.f, 4000.f);
+			} else {
+				cachedF0 = dsp::FREQ_C4; // not used in audio/trigger modes
+				formantTransposeRatio = sfs_lut::pow2(voct);
 			}
-			currentFormantFreq[i] = formantFreqs[i];
-			currentFormantBW[i] = formantBWs[i];
-			currentFormantAmp[i] = formantAmps[i];
+
+			// Decode vowel position once for all formants
+			float baseFreqs[NUM_FORMANTS];
+			vowelFreqs(vowelPos, baseFreqs);
+
+			// Per-formant params
+			cachedFormantsChanged = false;
+			for (int i = 0; i < NUM_FORMANTS; i++) {
+				float offset = params[F1_FREQ_PARAM + i].getValue();
+				if (inputs[F1_FREQ_CV + i].isConnected())
+					offset += inputs[F1_FREQ_CV + i].getVoltage() / 5.f;
+				offset = clamp(offset, -1.f, 1.f);
+				float freq = clamp(baseFreqs[i] * sfs_lut::pow2(offset) * formantTransposeRatio,
+				                   30.f, 8000.f);
+				cachedFormantFreqs[i] = freq;
+
+				float bw = params[F1_BW_PARAM + i].getValue();
+				if (inputs[F1_BW_CV + i].isConnected())
+					bw += inputs[F1_BW_CV + i].getVoltage() * 50.f;
+				cachedFormantBWs[i] = clamp(bw, 30.f, 500.f);
+
+				cachedFormantAmps[i] = params[F1_AMP_PARAM + i].getValue();
+
+				// Display dirty detection
+				if (std::fabs(currentFormantFreq[i] - cachedFormantFreqs[i]) > 0.5f ||
+				    std::fabs(currentFormantBW[i] - cachedFormantBWs[i]) > 0.5f ||
+				    std::fabs(currentFormantAmp[i] - cachedFormantAmps[i]) > 0.001f) {
+					cachedFormantsChanged = true;
+				}
+				currentFormantFreq[i] = cachedFormantFreqs[i];
+				currentFormantBW[i]   = cachedFormantBWs[i];
+				currentFormantAmp[i]  = cachedFormantAmps[i];
+			}
+			if (cachedFormantsChanged) displayDirty = true;
 		}
-		if (changed) displayDirty = true;
+
+		// Local aliases for readability — these are the cached values.
+		// (defaultMode is not currently consumed below, only audioMode and
+		// triggerMode are checked, but kept commented for clarity.)
+		// const bool defaultMode = cachedDefaultMode;
+		const bool audioMode   = cachedAudioMode;
+		const bool triggerMode = cachedTriggerMode;
+		const float f0 = cachedF0;
+		const float beta = cachedBeta;
+		const float* formantFreqs = cachedFormantFreqs;
+		const float* formantBWs   = cachedFormantBWs;
+		const float* formantAmps  = cachedFormantAmps;
+		const bool changed        = recompute && cachedFormantsChanged;
 
 		float out = 0.f;
 

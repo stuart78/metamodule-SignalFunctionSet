@@ -59,6 +59,13 @@ struct Drift : Module {
 	float brownianTarget[4] = {0.f, 0.f, 0.f, 0.f};
 	float lastBrownianPhase[4] = {0.f, 0.f, 0.f, 0.f};
 
+	// Lorenz integration is expensive (12 multiply-adds × 4 outputs per sample
+	// = 48 mul-adds + branches). Chaos doesn't need audio-rate updates; running
+	// at a fraction of the sample rate is inaudible. We accumulate dt across
+	// skipped samples and apply a single integration step every N samples.
+	static constexpr int LORENZ_THROTTLE = 16; // updates ~3kHz at 48kHz
+	int lorenzCounter = 0;
+
 	Drift() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 		configParam(PARAMSHAPE_PARAM, 0.f, 1.f, 0.5f, "Shape", "", 0.f, 1.f);
@@ -104,64 +111,44 @@ struct Drift : Module {
 		lastBrownianPhase[outputIndex] = phase;
 	}
 
+	// Inlined small helpers — shape regions only blend two adjacent waveforms,
+	// so we only compute the two we need (was: always computing all four +
+	// brownian regardless of shape, ~3-4× wasted work per sample).
+	static inline float waveTriangle(float phase) {
+		if (phase < 0.25f) return 4.f * phase;
+		if (phase < 0.75f) return 2.f - 4.f * phase;
+		return 4.f * phase - 4.f;
+	}
+	static inline float waveSaw(float phase) {
+		return (phase < 0.5f) ? (2.f * phase) : (2.f * phase - 2.f);
+	}
+	static inline float waveSquare(float phase) {
+		if (phase < 0.001f || phase > 0.999f) return 0.f;
+		return (phase < 0.5f) ? 1.f : -1.f;
+	}
+
 	float generateWave(float phase, float shape, int outputIndex, float sampleTime) {
-		// Generate base waveforms - all bipolar ±1, perfectly phase-aligned
-		// All waveforms start at 0 when phase=0
-		
-		float sine = sfs_lut::sine(phase);
-		
-		// Triangle wave: starts at 0, goes to +1 at 0.25, back to 0 at 0.5, to -1 at 0.75, back to 0 at 1.0
-		float triangle;
-		if (phase < 0.25f) {
-			triangle = 4.f * phase; // 0 to +1
-		} else if (phase < 0.75f) {
-			triangle = 2.f - 4.f * phase; // +1 to -1
-		} else {
-			triangle = 4.f * phase - 4.f; // -1 to 0
-		}
-		
-		// Sawtooth wave: starts at 0, ramps linearly to +1 at 0.5, jumps to -1, ramps to 0 at 1.0
-		float sawtooth;
-		if (phase < 0.5f) {
-			sawtooth = 2.f * phase; // 0 to +1
-		} else {
-			sawtooth = 2.f * phase - 2.f; // -1 to 0 (after jump from +1 to -1)
-		}
-		
-		// Square wave. Original called std::sin just to take its sign — we
-		// can do the same thing with a phase compare (sin(2π·phase) ≥ 0
-		// iff phase ∈ [0, 0.5]).
-		float square = (phase < 0.5f) ? 1.f : -1.f;
-		// Override the exact phase=0 case to ensure it starts at 0
-		if (phase < 0.001f || phase > 0.999f) {
-			square = 0.f;
-		}
-		
-		// Brownian motion chaos
-		updateBrownianMotion(outputIndex, phase, sampleTime);
-		float chaos = brownianValue[outputIndex];
-		
-		// Morphing between waveforms using smooth interpolation
+		// Branch on shape region first so we only compute the two waveforms
+		// being blended. Each region is a smooth lerp between adjacent shapes.
 		if (shape <= 0.25f) {
-			// Sine to Triangle (0.0 to 0.25)
+			// Sine to Triangle
 			float mix = shape * 4.f;
-			return sine * (1.f - mix) + triangle * mix;
+			return sfs_lut::sine(phase) * (1.f - mix) + waveTriangle(phase) * mix;
 		}
-		else if (shape <= 0.5f) {
-			// Triangle to Sawtooth (0.25 to 0.5)
+		if (shape <= 0.5f) {
+			// Triangle to Sawtooth
 			float mix = (shape - 0.25f) * 4.f;
-			return triangle * (1.f - mix) + sawtooth * mix;
+			return waveTriangle(phase) * (1.f - mix) + waveSaw(phase) * mix;
 		}
-		else if (shape <= 0.75f) {
-			// Sawtooth to Square (0.5 to 0.75)
+		if (shape <= 0.75f) {
+			// Sawtooth to Square
 			float mix = (shape - 0.5f) * 4.f;
-			return sawtooth * (1.f - mix) + square * mix;
+			return waveSaw(phase) * (1.f - mix) + waveSquare(phase) * mix;
 		}
-		else {
-			// Square to Chaos (0.75 to 1.0)
-			float mix = (shape - 0.75f) * 4.f;
-			return square * (1.f - mix) + chaos * mix;
-		}
+		// Square to Chaos — Brownian only updated when actually used (>0.75).
+		updateBrownianMotion(outputIndex, phase, sampleTime);
+		float mix = (shape - 0.75f) * 4.f;
+		return waveSquare(phase) * (1.f - mix) + brownianValue[outputIndex] * mix;
 	}
 
 	void process(const ProcessArgs& args) override {
@@ -229,16 +216,17 @@ struct Drift : Module {
 		if (phases[0] >= 1.f)
 			phases[0] -= 1.f;
 
-		// Update Lorenz attractors for each output
-		float lorenzDt = args.sampleTime * (1.f - stability) * 2.0f; // Scale with instability only, not frequency
-		for (int i = 0; i < 4; i++) {
-			if (stability < 1.f) { // Only update when instability is present
+		// Update Lorenz attractors — throttled to every LORENZ_THROTTLE samples.
+		// Multiplying lorenzDt by the throttle count keeps the effective rate
+		// of change identical to per-sample integration.
+		if (stability < 1.f && (++lorenzCounter >= LORENZ_THROTTLE)) {
+			lorenzCounter = 0;
+			float lorenzDt = args.sampleTime * (1.f - stability) * 2.0f * (float)LORENZ_THROTTLE;
+			for (int i = 0; i < 4; i++) {
 				// Lorenz equations: dx/dt = σ(y-x), dy/dt = x(ρ-z)-y, dz/dt = xy-βz
 				float dx = lorenzSigma[i] * (lorenz[i].y - lorenz[i].x);
 				float dy = lorenz[i].x * (lorenzRho[i] - lorenz[i].z) - lorenz[i].y;
 				float dz = lorenz[i].x * lorenz[i].y - lorenzBeta[i] * lorenz[i].z;
-				
-				// Integrate using Euler method
 				lorenz[i].x += dx * lorenzDt;
 				lorenz[i].y += dy * lorenzDt;
 				lorenz[i].z += dz * lorenzDt;
@@ -254,44 +242,44 @@ struct Drift : Module {
 			if (adjustedPhase >= 1.f)
 				adjustedPhase -= 1.f;
 
-			// Generate base wave
-			float wave = generateWave(adjustedPhase, shape, i, args.sampleTime);
-			
-			// Apply Lorenz attractor-based stability modulation
-			if (stability < 1.f) {
+			float wave;
+
+			if (stability >= 1.f) {
+				// Stable: generate directly from adjustedPhase. (No Lorenz
+				// modulation needed, so we don't compute it twice.)
+				wave = generateWave(adjustedPhase, shape, i, args.sampleTime);
+			} else {
+				// Unstable: apply Lorenz-based phase/freq/amp modulation, then
+				// generate exactly once.
 				float instabilityAmount = 1.f - stability;
-				
+
 				// Normalize Lorenz coordinates to usable ranges
 				// X and Y typically range ±20, Z ranges 0-50
-				float lorenzX = clamp(lorenz[i].x / 20.f, -1.f, 1.f);   // Phase modulation
-				float lorenzY = clamp(lorenz[i].y / 20.f, -1.f, 1.f);   // Amplitude modulation  
-				float lorenzZ = clamp((lorenz[i].z - 25.f) / 25.f, -1.f, 1.f); // Frequency modulation
-				
-				// Phase modulation - creates "drift" in timing
+				float lorenzX = clamp(lorenz[i].x / 20.f, -1.f, 1.f);
+				float lorenzY = clamp(lorenz[i].y / 20.f, -1.f, 1.f);
+				float lorenzZ = clamp((lorenz[i].z - 25.f) / 25.f, -1.f, 1.f);
+
+				// Phase modulation
 				float phaseOffset = lorenzX * instabilityAmount * 0.1f;
 				float driftedPhase = adjustedPhase + phaseOffset;
-				while (driftedPhase < 0.f) driftedPhase += 1.f;
-				while (driftedPhase >= 1.f) driftedPhase -= 1.f;
-				
-				// Amplitude modulation - creates "breathing" effect
-				float ampMod = 1.f + (lorenzY * instabilityAmount * 0.3f);
-				ampMod = clamp(ampMod, 0.3f, 1.7f); // Reasonable range
-				
-				// Frequency modulation - creates subtle tempo variations
+				// Phase offset is bounded to ±0.1 so a single add/sub suffices.
+				if (driftedPhase < 0.f)  driftedPhase += 1.f;
+				if (driftedPhase >= 1.f) driftedPhase -= 1.f;
+
+				// Amplitude modulation
+				float ampMod = clamp(1.f + (lorenzY * instabilityAmount * 0.3f), 0.3f, 1.7f);
+
+				// Frequency modulation
 				float freqMod = 1.f + (lorenzZ * instabilityAmount * 0.05f);
 				float freqModulatedPhase = driftedPhase * freqMod;
-				while (freqModulatedPhase < 0.f) freqModulatedPhase += 1.f;
-				while (freqModulatedPhase >= 1.f) freqModulatedPhase -= 1.f;
-				
-				// Generate the wave with all modulations
+				if (freqModulatedPhase < 0.f)  freqModulatedPhase += 1.f;
+				if (freqModulatedPhase >= 1.f) freqModulatedPhase -= 1.f;
+
 				wave = generateWave(freqModulatedPhase, shape, i, args.sampleTime) * ampMod;
-				
-				// Add subtle harmonic content based on Lorenz Z.
-				// Original was sin(freqModulatedPhase * 3π) — i.e. sin at 1.5x
-				// the period. sfs_lut::sine takes phase in [0,1]=2π, so
-				// freqModulatedPhase * 3π / 2π = freqModulatedPhase * 1.5.
-				float harmonicContent = sfs_lut::sine(freqModulatedPhase * 1.5f) * lorenzZ * instabilityAmount * 0.1f;
-				wave += harmonicContent;
+
+				// Subtle harmonic content. sin(phase * 3π) → sfs_lut::sine
+				// takes phase in [0,1]=2π, so multiply by 1.5.
+				wave += sfs_lut::sine(freqModulatedPhase * 1.5f) * lorenzZ * instabilityAmount * 0.1f;
 			}
 
 			// Scale and offset
