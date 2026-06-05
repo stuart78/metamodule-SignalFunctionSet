@@ -5,14 +5,18 @@
   "MetaModulePluginMaintainerUrl": "https://signalfunctionset.com/",
   "MetaModuleDescription": "Nine modules covering synthesis voices, sequencers, sample manipulation, and clocks. A complete musical toolkit for patching.",
   "MetaModuleIncludedModules": [
-    { "slug": "Drift",    "name": "Drift" },
-    { "slug": "gsx",      "name": "GSX" },
-    { "slug": "Fugue",    "name": "Fugue" },
-    { "slug": "Phase",    "name": "Phase" },
-    { "slug": "Overtone", "name": "Overtone" },
-    { "slug": "Intone",   "name": "Intone" },
-    { "slug": "Tine",     "name": "Tine" },
-    { "slug": "Meter",    "name": "Meter" },
-    { "slug": "Swell",    "name": "Swell" }
+    { "slug": "Drift",     "name": "Drift" },
+    { "slug": "gsx",       "name": "GSX" },
+    { "slug": "Fugue",     "name": "Fugue" },
+    { "slug": "MetaFugue", "name": "MetaFugue" },
+    { "slug": "Phase",     "name": "Phase" },
+    { "slug": "Overtone",  "name": "Overtone" },
+    { "slug": "Intone",    "name": "Intone" },
+    { "slug": "Tine",      "name": "Tine" },
+    { "slug": "Meter",     "name": "Meter" },
+    { "slug": "Swell",     "name": "Swell" },
+    { "slug": "Shift",     "name": "Shift" },
+    { "slug": "Vac",       "name": "Vac" },
+    { "slug": "Band",      "name": "Band" }
   ]
 }

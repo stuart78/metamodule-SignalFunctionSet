@@ -13,7 +13,7 @@ endif()
 include(${METAMODULE_SDK_DIR}/plugin.cmake)
 
 project(SignalFunctionSet
-    VERSION 1.0.2
+    VERSION 1.1.0
     DESCRIPTION "Signal Function Set plugin for MetaModule"
     LANGUAGES C CXX ASM
 )
@@ -38,6 +38,10 @@ target_sources(SignalFunctionSet PRIVATE
     ${SOURCE_DIR}/src/tine.cpp
     ${SOURCE_DIR}/src/meter.cpp
     ${SOURCE_DIR}/src/swell.cpp
+    ${SOURCE_DIR}/src/shift.cpp
+    ${SOURCE_DIR}/src/vac.cpp
+    ${SOURCE_DIR}/src/band.cpp
+    ${SOURCE_DIR}/src/metafugue.cpp
 )
 
 target_include_directories(SignalFunctionSet PRIVATE

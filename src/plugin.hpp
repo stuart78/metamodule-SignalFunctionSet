@@ -17,5 +17,9 @@ extern Model* modelIntone;
 extern Model* modelTine;
 extern Model* modelMeter;
 extern Model* modelSwell;
+extern Model* modelShift;
+extern Model* modelVac;
+extern Model* modelBand;
+extern Model* modelMetaFugue;
 // MetaModule does not support expanders or Beat/Note (screen-dependent):
 // modelFugueX, modelBeat, modelNote are intentionally omitted.
