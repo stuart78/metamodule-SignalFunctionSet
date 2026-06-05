@@ -42,6 +42,7 @@ target_sources(SignalFunctionSet PRIVATE
     ${SOURCE_DIR}/src/vac.cpp
     ${SOURCE_DIR}/src/band.cpp
     ${SOURCE_DIR}/src/metafugue.cpp
+    ${SOURCE_DIR}/src/muse.cpp
 )
 
 target_include_directories(SignalFunctionSet PRIVATE

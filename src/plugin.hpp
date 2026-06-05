@@ -21,5 +21,6 @@ extern Model* modelShift;
 extern Model* modelVac;
 extern Model* modelBand;
 extern Model* modelMetaFugue;
+extern Model* modelMuse;
 // MetaModule does not support expanders or Beat/Note (screen-dependent):
 // modelFugueX, modelBeat, modelNote are intentionally omitted.

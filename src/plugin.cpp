@@ -19,5 +19,6 @@ void init(Plugin* p) {
 	p->addModel(modelVac);
 	p->addModel(modelBand);
 	p->addModel(modelMetaFugue);
+	p->addModel(modelMuse);
 	// FugueX (expander), Beat, and Note are not ported to MetaModule.
 }

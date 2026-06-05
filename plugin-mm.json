@@ -17,6 +17,7 @@
     { "slug": "Swell",     "name": "Swell" },
     { "slug": "Shift",     "name": "Shift" },
     { "slug": "Vac",       "name": "Vac" },
-    { "slug": "Band",      "name": "Band" }
+    { "slug": "Band",      "name": "Band" },
+    { "slug": "Muse",      "name": "Muse" }
   ]
 }
