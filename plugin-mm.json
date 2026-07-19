@@ -3,7 +3,7 @@
   "MetaModulePluginMaintainer": "Stuart Frederich-Smith",
   "MetaModulePluginMaintainerEmail": "hello@signalfunctionset.com",
   "MetaModulePluginMaintainerUrl": "https://signalfunctionset.com/",
-  "MetaModuleDescription": "Nine modules covering synthesis voices, sequencers, sample manipulation, and clocks. A complete musical toolkit for patching.",
+  "MetaModuleDescription": "A family of modules for synthesis voices, sequencers, sample manipulation, and clocks. A complete musical toolkit for patching.",
   "MetaModuleIncludedModules": [
     { "slug": "Drift",     "name": "Drift" },
     { "slug": "gsx",       "name": "GSX" },
@@ -18,6 +18,15 @@
     { "slug": "Shift",     "name": "Shift" },
     { "slug": "Vac",       "name": "Vac" },
     { "slug": "Band",      "name": "Band" },
-    { "slug": "Muse",      "name": "Muse" }
+    { "slug": "Muse",      "name": "Muse" },
+    { "slug": "Cycle",     "name": "Cycle" },
+    { "slug": "Chance",    "name": "Chance" },
+    { "slug": "Operator",  "name": "Operator", "displayName": "Operator" },
+    { "slug": "OpEnv",     "name": "OP ENV",   "displayName": "OP ENV" },
+    { "slug": "Beat",      "name": "Beat",     "displayName": "Beat" },
+    { "slug": "Note",      "name": "Note",     "displayName": "Note" },
+    { "slug": "Arrange",   "name": "Arrange",  "displayName": "Arrange" },
+    { "slug": "Record",    "name": "Record",   "displayName": "Record" },
+    { "slug": "Play",      "name": "Play",     "displayName": "Play" }
   ]
 }

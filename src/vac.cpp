@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 
 // =============================================================================
@@ -74,6 +75,11 @@ struct Vac : Module {
 	// Continuous-drift state (smoothed random per stage)
 	float driftSmoothed[2] = {};      // 0 = rise, 1 = fall
 
+	// Cached one-pole LPF alpha for continuous drift — depends only on
+	// samplerate, so we recompute only when it changes instead of every sample.
+	float cachedSampleRateVac = 0.f;
+	float driftAlpha = 0.f;
+
 	// --- Param quantities ---
 	struct RiseFallQuantity : ParamQuantity {
 		std::string getDisplayValueString() override {
@@ -142,10 +148,19 @@ struct Vac : Module {
 
 	// Convert normalized rise/fall param (0..1) → seconds (1ms..5s exponential).
 	static float paramToSeconds(float v) {
-		return 0.001f * std::pow(5000.f, clamp(v, 0.f, 1.f));
+		// pow(5000, k) = pow2(k * log2(5000))
+		static constexpr float LOG2_5000 = 12.287712f;
+		return 0.001f * sfs_lut::pow2(clamp(v, 0.f, 1.f) * LOG2_5000);
 	}
 
 	void process(const ProcessArgs& args) override {
+		// Cache the LPF alpha whenever samplerate changes — was recomputed
+		// every sample inside driftFactor via std::exp.
+		if (args.sampleRate != cachedSampleRateVac) {
+			cachedSampleRateVac = args.sampleRate;
+			driftAlpha = 1.f - std::exp(-2.f * (float)M_PI * 2.f * args.sampleTime);
+		}
+
 		// --- Read params + CV ---
 		float baseRise = paramToSeconds(readParamCV(params[RISE_PARAM],
 			inputs[RISE_CV_INPUT], 0.f, 1.f));
@@ -181,12 +196,14 @@ struct Vac : Module {
 		auto driftFactor = [&](int idx, float stab) -> float {
 			if (!continuousDrift || std::fabs(stab) < 1e-4f) return 1.f;
 			float target = random::uniform() * 2.f - 1.f;
-			float alpha = 1.f - std::exp(-2.f * (float)M_PI * 2.f * args.sampleTime);
-			driftSmoothed[idx] += alpha * (target - driftSmoothed[idx]);
+			// Use cached driftAlpha (recomputed only when sampleRate changes below)
+			driftSmoothed[idx] += driftAlpha * (target - driftSmoothed[idx]);
 			// Amplify since LPF on white noise has tiny RMS; this gets back to
 			// roughly ±1 range during a stage.
 			float scaled = clamp(driftSmoothed[idx] * 10.f, -1.f, 1.f);
-			return std::exp(stab * scaled * STAB_LOG_K);
+			// exp(x) = pow2(x * log2(e)) — LUT avoids per-sample std::exp.
+			static constexpr float LOG2_E_VAC = 1.4426950f;
+			return sfs_lut::pow2(stab * scaled * STAB_LOG_K * LOG2_E_VAC);
 		};
 
 		// --- State machine ---
@@ -275,10 +292,10 @@ struct VacWidget : ModuleWidget {
 		// LOOP — light latch with embedded green LED + TRIG in
 		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<GreenLight>>>(
 			mm2px(Vec(xL, 106.67f)), module, Vac::LOOP_PARAM, Vac::LOOP_LIGHT));
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xR, 106.67f)), module, Vac::TRIG_INPUT));
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xR, 106.67f)), module, Vac::END_OUTPUT));
 
 		// END trig out, ENV audio out
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xL, 121.92f)), module, Vac::END_OUTPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xL, 121.92f)), module, Vac::TRIG_INPUT));
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xR, 121.92f)), module, Vac::ENV_OUTPUT));
 	}
 

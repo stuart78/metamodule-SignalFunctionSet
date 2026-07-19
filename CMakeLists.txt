@@ -13,7 +13,7 @@ endif()
 include(${METAMODULE_SDK_DIR}/plugin.cmake)
 
 project(SignalFunctionSet
-    VERSION 1.1.0
+    VERSION 1.4.2
     DESCRIPTION "Signal Function Set plugin for MetaModule"
     LANGUAGES C CXX ASM
 )
@@ -43,10 +43,53 @@ target_sources(SignalFunctionSet PRIVATE
     ${SOURCE_DIR}/src/band.cpp
     ${SOURCE_DIR}/src/metafugue.cpp
     ${SOURCE_DIR}/src/muse.cpp
+    ${SOURCE_DIR}/src/cycle.cpp
+    ${SOURCE_DIR}/src/chance.cpp
+    # Operator (Bell) + OP ENV (OpEnv) + vendored msfa DX7 engine
+    ${SOURCE_DIR}/src/bell.cpp
+    ${SOURCE_DIR}/src/bell_voice.cpp
+    ${SOURCE_DIR}/src/op_env.cpp
+    ${SOURCE_DIR}/src/op_env_engine.cpp
+    ${SOURCE_DIR}/src/msfa/dx7note.cc
+    ${SOURCE_DIR}/src/msfa/env.cc
+    ${SOURCE_DIR}/src/msfa/exp2.cc
+    ${SOURCE_DIR}/src/msfa/fm_core.cc
+    ${SOURCE_DIR}/src/msfa/fm_op_kernel.cc
+    ${SOURCE_DIR}/src/msfa/freqlut.cc
+    ${SOURCE_DIR}/src/msfa/lfo.cc
+    ${SOURCE_DIR}/src/msfa/log2.cc
+    ${SOURCE_DIR}/src/msfa/patch.cc
+    ${SOURCE_DIR}/src/msfa/pitchenv.cc
+    ${SOURCE_DIR}/src/msfa/sin.cc
+    # Sequencers whose editing lives on the display — patterns can be built in
+    # VCV and played back on MetaModule.
+    ${SOURCE_DIR}/src/beat.cpp
+    ${SOURCE_DIR}/src/note.cpp
+    # New: song-form arrangement sequencer + auto-sampler + poly SFZ player.
+    ${SOURCE_DIR}/src/arrange.cpp
+    ${SOURCE_DIR}/src/record.cpp
+    ${SOURCE_DIR}/src/play.cpp
 )
 
 target_include_directories(SignalFunctionSet PRIVATE
     ${SOURCE_DIR}/src
+)
+
+# The vendored msfa DX7 engine was written for desktop compilers and mixes
+# `int*` with `int32_t*`. On MetaModule's ARM toolchain int32_t is `long int`,
+# so the strict type checker rejects calls that desktop compilers waved
+# through. -fpermissive downgrades those mismatches to warnings; the
+# code is correct on either ABI because the pointed-to values are still
+# 32-bit signed integers.
+set_source_files_properties(
+    ${SOURCE_DIR}/src/msfa/fm_op_kernel.cc
+    ${SOURCE_DIR}/src/msfa/dx7note.cc
+    ${SOURCE_DIR}/src/msfa/fm_core.cc
+    ${SOURCE_DIR}/src/msfa/env.cc
+    ${SOURCE_DIR}/src/msfa/lfo.cc
+    ${SOURCE_DIR}/src/msfa/pitchenv.cc
+    ${SOURCE_DIR}/src/msfa/patch.cc
+    PROPERTIES COMPILE_FLAGS "-fpermissive -Wno-narrowing"
 )
 
 target_compile_definitions(SignalFunctionSet PRIVATE

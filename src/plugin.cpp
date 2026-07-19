@@ -20,5 +20,15 @@ void init(Plugin* p) {
 	p->addModel(modelBand);
 	p->addModel(modelMetaFugue);
 	p->addModel(modelMuse);
-	// FugueX (expander), Beat, and Note are not ported to MetaModule.
+	p->addModel(modelCycle);
+	p->addModel(modelChance);
+	p->addModel(modelOperator);
+	p->addModel(modelOpEnv);
+	p->addModel(modelBeat);
+	p->addModel(modelNote);
+	p->addModel(modelArrange);
+	p->addModel(modelRecord);
+	p->addModel(modelPlay);
+	// FugueX and MeterX (expanders) are not ported to MetaModule.
+	// Wave/Ratio/Gravity remain WIP/hidden on VCV and are not shipped here.
 }

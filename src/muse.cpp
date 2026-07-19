@@ -279,6 +279,13 @@ struct Muse : Module {
 	dsp::SchmittTrigger randButtonTrigger;
 	dsp::PulseGenerator gatePulse;
 
+	// 50%-duty gate: the gate stays high for half the measured clock interval,
+	// so it actually sustains a synth voice (instead of a 1ms trigger).
+	int  samplesSinceTick = 0;
+	int  tickInterval = 0;
+	bool haveTickInterval = false;
+	int  gateRemaining = 0;
+
 	bool running = true;
 	bool gateOnChangeOnly = false;
 	int  lastPitchAddr = -1;
@@ -318,9 +325,8 @@ struct Muse : Module {
 	int     scopeFilled = 0;
 
 #ifndef METAMODULE
-	// Expander message buffers (this Muse → its right-neighbor Muse).
-	// MetaModule doesn't support expanders, so we skip the alloc/dealloc and
-	// linking machinery entirely; standalone Muse still works.
+	// MetaModule doesn't support expanders, so the master-slave linking is
+	// disabled there. Standalone Muse works identically.
 	~Muse() {
 		delete (MuseLinkMessage*)rightExpander.producerMessage;
 		delete (MuseLinkMessage*)rightExpander.consumerMessage;
@@ -339,13 +345,22 @@ struct Muse : Module {
 		for (int i = 0; i < 4; i++) {
 			configParam(THEME_PARAM_0 + i, 0.f, (float)(N_TAPS - 1), 0.f,
 				string::f("Theme %d tap", i + 1));
+#ifndef METAMODULE
+			// MetaModule maps a snapped slider onto its SlideSwitch element,
+			// which caps out at 8 positions — far too few for 40 taps. Leave
+			// the param continuous there (a full-resolution Slider element);
+			// the DSP already rounds to the nearest tap, and the display
+			// column shows the active tap.
 			paramQuantities[THEME_PARAM_0 + i]->snapEnabled = true;
+#endif
 		}
 		for (int i = 0; i < 4; i++) {
 			const char* nm[4] = {"A", "B", "C", "D"};
 			configParam(INTERVAL_PARAM_0 + i, 0.f, (float)(N_TAPS - 1), 0.f,
 				string::f("Interval %s tap", nm[i]));
+#ifndef METAMODULE
 			paramQuantities[INTERVAL_PARAM_0 + i]->snapEnabled = true;
+#endif
 		}
 
 		configParam<RootParamQuantity>(ROOT_PARAM, -24.f, 24.f, 0.f, "Root");
@@ -491,7 +506,6 @@ struct Muse : Module {
 			}
 		}
 #else
-		// MetaModule: no expander support; suppress unused-variable warnings
 		(void)recvSr; (void)recvBinC; (void)recvMod12C;
 		(void)recvClockHigh; (void)recvTicked; (void)recvFb; (void)recvHops;
 #endif
@@ -520,6 +534,9 @@ struct Muse : Module {
 		if (resetEdge) {
 			if (!followingThisFrame) core.clearState();
 			lastPitchAddr = -1;
+			gateRemaining = 0;
+			samplesSinceTick = 0;
+			haveTickInterval = false;
 		}
 
 		// --- Random (button or CV) ---
@@ -537,6 +554,8 @@ struct Muse : Module {
 		syncSlidersToCore();
 
 		// --- Advance machine ---
+		// Time since the last clock tick, used to size the 50%-duty gate.
+		samplesSinceTick = std::min(samplesSinceTick + 1, (int)(args.sampleRate * 10.f));
 		bool didTickThisFrame = false;
 		uint8_t myFbBit = 0;
 
@@ -560,7 +579,10 @@ struct Muse : Module {
 
 				bool emitGate = !gateOnChangeOnly || (addr != lastPitchAddr);
 				lastPitchAddr = addr;
-				if (emitGate) gatePulse.trigger(0.001f);
+				if (emitGate) {
+					int ivl = haveTickInterval ? samplesSinceTick : (int)(args.sampleRate * 0.05f);
+					gateRemaining = std::max(1, ivl / 2);
+				}
 			}
 		} else {
 			// Standalone / master path: drive from our own CLOCK input
@@ -584,9 +606,19 @@ struct Muse : Module {
 
 					bool emitGate = !gateOnChangeOnly || (addr != lastPitchAddr);
 					lastPitchAddr = addr;
-					if (emitGate) gatePulse.trigger(0.001f);
+					if (emitGate) {
+						int ivl = haveTickInterval ? samplesSinceTick : (int)(args.sampleRate * 0.05f);
+						gateRemaining = std::max(1, ivl / 2);
+					}
 				}
 			}
+		}
+
+		// Capture the clock interval and reset the counter on each tick.
+		if (didTickThisFrame) {
+			tickInterval = samplesSinceTick;
+			samplesSinceTick = 0;
+			haveTickInterval = true;
 		}
 
 #ifndef METAMODULE
@@ -637,7 +669,9 @@ struct Muse : Module {
 			cvOut = (pitchSemis / scaleMaxSemis) * targetV;
 		}
 		outputs[VOCT_OUTPUT].setVoltage(cvOut);
-		outputs[GATE_OUTPUT].setVoltage(gatePulse.process(args.sampleTime) ? 10.f : 0.f);
+		bool gateHi = gateRemaining > 0;
+		if (gateRemaining > 0) gateRemaining--;
+		outputs[GATE_OUTPUT].setVoltage(gateHi ? 10.f : 0.f);
 	}
 
 	json_t* dataToJson() override {
@@ -681,21 +715,26 @@ struct MuseSlider : app::SvgSlider {
 	MuseSlider() {
 		setBackgroundSvg(Svg::load(asset::plugin(pluginInstance, "res/muse-slider-bg.svg")));
 		setHandleSvg(Svg::load(asset::plugin(pluginInstance, "res/muse-slider-handle.svg")));
-		// Background SVG is 17 wide × 261 tall (SVG units), with a 40-tick rail
-		// at y = 3 .. 258. Handle is 17 wide × 6 tall, anchored on its center,
-		// and we align its centers with the first and last tick.
-		//
-		// Faithful layout puts value 0 (= OFF) at the TOP and value 39 (= B31)
-		// at the BOTTOM, matching the original Muse and till.com. Because
-		// Knob::onDragMove hard-codes "drag up = value increases", we invert
-		// the drag direction by setting speed = -1 so dragging DOWN increases
-		// value — which visually moves the handle down through the tap list
-		// (the handle follows the finger; up = lower tap index = OFF/ON/C½...).
+#ifdef METAMODULE
+		// MetaModule's SvgSlider doesn't honor Knob::speed = -1 the way VCV
+		// does, so use the SDK's standard convention: min handle pos at
+		// BOTTOM, max at TOP, no speed inversion. The MuseDisplay's label
+		// column is also flipped (see drawLayer) so OFF still aligns with
+		// the slider's physical position.
+		setHandlePosCentered(
+			math::Vec(17.f / 2.f, 258.f),    // value MIN at bottom
+			math::Vec(17.f / 2.f,   3.f)     // value MAX at top
+		);
+		(void)0;
+#else
+		// VCV: value 0 (OFF) at top, value 39 (B31) at bottom, with speed=-1
+		// to make dragging DOWN increase value (handle follows finger).
 		setHandlePosCentered(
 			math::Vec(17.f / 2.f,   3.f),    // value MIN aligns with tick 0 (top)
 			math::Vec(17.f / 2.f, 258.f)     // value MAX aligns with tick 39 (bottom)
 		);
 		speed = -1.f;
+#endif
 	}
 
 	void draw(const DrawArgs& args) override {
@@ -820,7 +859,14 @@ void MuseDisplay::drawLayer(const DrawArgs& args, int layer) {
 	}
 
 	for (int i = 0; i < N_TAPS; i++) {
-		float cy = gridTop + (i + 0.5f) * rowH;
+#ifdef METAMODULE
+		// MetaModule: sliders use standard convention (value 0 at BOTTOM),
+		// so flip label rows to match — tap i is drawn at (N_TAPS - 1 - i).
+		int displayRow = (N_TAPS - 1) - i;
+#else
+		int displayRow = i;
+#endif
+		float cy = gridTop + (displayRow + 0.5f) * rowH;
 		bool bitOn = module->core.tap(i);
 
 		// Is any slider on this row? Used to brighten label.

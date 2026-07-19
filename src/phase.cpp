@@ -1,13 +1,32 @@
 #include "plugin.hpp"
 #include <osdialog.h>
 #include <thread>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #ifdef METAMODULE
 #include "filesystem/async_filebrowser.hh"
 #include "filesystem/helpers.hh"
 #include "patch/patch_file.hh"
+// MetaModule's newlib doesn't provide <mutex>. The Phase module uses
+// std::mutex / std::unique_lock to coordinate cue-edit access between
+// the GUI thread and the audio thread. On MetaModule, the audio engine
+// pauses during patch load and GUI callbacks, so no-op stubs are safe.
+namespace std {
+struct mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+template<typename T> struct lock_guard { lock_guard(T&) {} };
+struct try_to_lock_t {};
+inline constexpr try_to_lock_t try_to_lock{};
+template<typename T> struct unique_lock {
+	unique_lock(T&) {}
+	unique_lock(T&, try_to_lock_t) {}
+	bool owns_lock() const { return true; }
+};
+}
+#else
+#include <mutex>
 #endif
 
 #define DR_WAV_IMPLEMENTATION
@@ -20,19 +39,91 @@ static const int WAVEFORM_POINTS = 512;
 // WAV file filter for open dialog
 static const char PHASE_WAV_FILTERS[] = "WAV file (.wav):wav;All files (*.*):*";
 
-// Max sample length: 10 minutes at 48kHz
-static const size_t MAX_SAMPLE_LENGTH = 48000 * 60 * 10;
+#ifdef METAMODULE
+// On MetaModule we halve sample-buffer memory by storing samples as int16
+// instead of float. 16-bit at 48kHz is still transparent quality for looper
+// work; the memory saving matters because MetaModule shares ~300MB across all
+// plugins. We also cap max sample/record length harder than desktop.
+using PhaseSampleT = int16_t;
+static const size_t MAX_SAMPLE_LENGTH = 48000 * 60 * 3;  //  3 min per loop
+static const size_t MAX_REC_LENGTH    = 48000 * 30;      // 30 s per record
+static inline float sampleToFloat(int16_t s) { return (float)s * (1.f / 32768.f); }
+static inline int16_t floatToSample(float f) {
+	if (f >=  1.f) return  32767;
+	if (f <= -1.f) return -32768;
+	return (int16_t)(f * 32768.f);
+}
+#else
+// VCV (desktop): float storage, generous limits.
+using PhaseSampleT = float;
+static const size_t MAX_SAMPLE_LENGTH = 48000 * 60 * 10; // 10 min per loop
+static const size_t MAX_REC_LENGTH    = 48000 * 60;      // 60 s per record
+static inline float sampleToFloat(float s) { return s; }
+static inline float floatToSample(float f) { return f; }
+#endif
+
+
+// --- Base64 helpers (used to embed audio buffers in patch JSON) ---
+// Standard base64 alphabet, no line wrapping.
+static const char B64_CHARS[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64Encode(const uint8_t* data, size_t len) {
+	std::string out;
+	out.reserve(((len + 2) / 3) * 4);
+	for (size_t i = 0; i < len; i += 3) {
+		uint32_t v = (uint32_t)data[i] << 16;
+		if (i + 1 < len) v |= (uint32_t)data[i + 1] << 8;
+		if (i + 2 < len) v |= (uint32_t)data[i + 2];
+		out.push_back(B64_CHARS[(v >> 18) & 0x3F]);
+		out.push_back(B64_CHARS[(v >> 12) & 0x3F]);
+		out.push_back(i + 1 < len ? B64_CHARS[(v >> 6) & 0x3F] : '=');
+		out.push_back(i + 2 < len ? B64_CHARS[v & 0x3F] : '=');
+	}
+	return out;
+}
+
+static std::vector<uint8_t> base64Decode(const std::string& s) {
+	static int8_t lookup[256];
+	static bool initLookup = false;
+	if (!initLookup) {
+		for (int i = 0; i < 256; i++) lookup[i] = -1;
+		for (int i = 0; i < 64; i++) lookup[(uint8_t)B64_CHARS[i]] = (int8_t)i;
+		initLookup = true;
+	}
+	std::vector<uint8_t> out;
+	out.reserve((s.size() / 4) * 3);
+	uint32_t buf = 0;
+	int bits = 0;
+	for (char c : s) {
+		if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+		int8_t v = lookup[(uint8_t)c];
+		if (v < 0) continue;
+		buf = (buf << 6) | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back((uint8_t)((buf >> bits) & 0xFF));
+		}
+	}
+	return out;
+}
 
 
 struct SampleData {
-	std::vector<float> samples;
+	std::vector<PhaseSampleT> samples;   // int16 on MM, float on VCV
 	size_t length = 0;
 	std::string filePath;
 	std::string fileName;
 	std::vector<size_t> transients;
 	std::vector<float> waveformMini; // peak amplitude per display column
-	bool loaded = false;
+	// Atomic so the audio thread can safely check it without a lock.
+	// Writers (load/clear/finalize) set this to false BEFORE mutating
+	// `samples`/`length` and back to true after, so the audio thread skips
+	// reads of sd.samples whenever the buffer is in flux.
+	std::atomic<bool> loaded{false};
 	bool hasCuePoints = false; // true if transients came from WAV cue points
+	bool cuesEdited = false;   // true once cues were manually edited; persist them
 	// Loop region (normalized 0-1)
 	float loopStart = 0.f;
 	float loopEnd = 1.f;
@@ -53,6 +144,26 @@ struct LoopState {
 };
 
 
+// Live-recording state per buffer.
+// State machine:
+//   IDLE → ARMING (1ms fade-in) → ACTIVE → FINISHING (1ms fade-out) → IDLE
+// During ARMING/ACTIVE/FINISHING the loop's normal playback is suppressed
+// and a dry monitor passthrough is sent to the output instead.
+// On reaching IDLE after FINISHING, pendingFinalize is set and the widget
+// step() finalizes the recording on the GUI thread (copy into samples,
+// run waveform/transient analysis).
+struct RecState {
+	enum Phase { IDLE, ARMING, ACTIVE, FINISHING };
+	Phase phase = IDLE;
+	bool armed = false;             // panel-button latch state
+	std::atomic<size_t> writePos{0}; // current write index into recBuffer (atomic for GUI reads)
+	float envelope = 0.f;           // anti-click fade envelope
+	std::vector<PhaseSampleT> recBuffer;   // pre-allocated, MAX_REC_LENGTH
+	std::atomic<bool> pendingFinalize{false};
+	size_t recordedLength = 0;      // captured at FINISHING completion
+};
+
+
 // Forward declaration
 struct Phase;
 
@@ -65,9 +176,13 @@ struct PhaseWaveformDisplay : Widget {
 		LOOP_START_A,
 		LOOP_END_A,
 		LOOP_START_B,
-		LOOP_END_B
+		LOOP_END_B,
+		CUE_A,
+		CUE_B
 	};
 	DragTarget dragTarget = NONE;
+	int dragCueIdx = -1;   // index into the dragged sample's transients
+	Vec lastButtonPos;     // last left-press position (onDoubleClick carries none)
 
 	PhaseWaveformDisplay() {}
 
@@ -173,8 +288,6 @@ struct PhaseWaveformDisplay : Widget {
 
 		float tickLen = 5.f;    // horizontal tick length at top and bottom
 		float lineW = 1.f;      // vertical line width
-		// Bracket direction: start handle ticks go right, end handle ticks go left
-		float dir = isStart ? 1.f : -1.f;
 
 		// Draw as a single filled path (no transparency stacking)
 		nvgBeginPath(args.vg);
@@ -182,7 +295,6 @@ struct PhaseWaveformDisplay : Widget {
 		// Build bracket shape as a filled polygon
 		// Vertical bar + top tick + bottom tick
 		float barLeft = isStart ? px : px - lineW;
-		float barRight = isStart ? px + lineW : px;
 
 		// Vertical bar
 		nvgRect(args.vg, barLeft, y + 1.f, lineW, h - 2.f);
@@ -200,7 +312,9 @@ struct PhaseWaveformDisplay : Widget {
 	}
 
 	DragTarget hitTestHandle(Vec pos);
+	int hitTestCue(Vec pos, bool& isB);   // nearest cue index within hit radius, or -1
 	void onButton(const ButtonEvent& e) override;
+	void onDoubleClick(const DoubleClickEvent& e) override;
 	void onDragMove(const DragMoveEvent& e) override;
 	void onDragEnd(const DragEndEvent& e) override;
 
@@ -224,6 +338,9 @@ struct Phase : Module {
 		MODE_A_PARAM,  // 0 = sleep, 1 = rotate
 		MODE_B_PARAM,
 		SYNC_PARAM,
+		REC_A_PARAM,
+		REC_B_PARAM,
+		REC_LINK_PARAM,  // link switch: when on, REC A and REC B trigger together
 		PARAMS_LEN
 	};
 	enum InputId {
@@ -241,6 +358,10 @@ struct Phase : Module {
 		END_A_INPUT,
 		START_B_INPUT,
 		END_B_INPUT,
+		REC_A_INPUT,        // audio in for recording
+		REC_A_GATE_INPUT,   // record gate
+		REC_B_INPUT,        // audio in for recording (normalled from REC_A_INPUT)
+		REC_B_GATE_INPUT,   // record gate (normalled from REC_A_GATE_INPUT)
 		INPUTS_LEN
 	};
 	enum OutputId {
@@ -250,6 +371,9 @@ struct Phase : Module {
 	};
 	enum LightId {
 		PLAY_LIGHT,
+		REC_A_LIGHT,
+		REC_B_LIGHT,
+		REC_LINK_LIGHT,
 		LIGHTS_LEN
 	};
 
@@ -257,6 +381,8 @@ struct Phase : Module {
 	SampleData sampleB;
 	LoopState loopA;
 	LoopState loopB;
+	RecState recA;
+	RecState recB;
 	dsp::SchmittTrigger syncTrigger;
 	bool sampleBExplicitlyLoaded = false;
 	bool playing = false;
@@ -267,6 +393,13 @@ struct Phase : Module {
 	float transientMinGapMs = 100.f;
 	// VCA mode: anti-click envelope on jumps
 	bool vcaMode = true;
+	// Recording mode: false = replace (start fresh), true = append to existing audio
+	bool recordAppend = false;
+	// Link button latch: when true, REC A and REC B trigger together
+	bool recLink = false;
+	// Whether to embed recorded buffers in the patch JSON (default on).
+	// File-loaded samples are always referenced by path, never embedded.
+	bool persistRecordedBuffers = true;
 
 	Phase() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
@@ -302,8 +435,21 @@ struct Phase : Module {
 		configInput(START_B_INPUT, "Loop Start B (0-10V = 0-100%)");
 		configInput(END_B_INPUT, "Loop Length B (0-10V = 0-100%)");
 
+		configButton(REC_A_PARAM, "Record A (latch)");
+		configButton(REC_B_PARAM, "Record B (latch)");
+		configButton(REC_LINK_PARAM, "Link record buttons (one click triggers both)");
+		configInput(REC_A_INPUT, "Record A audio");
+		configInput(REC_A_GATE_INPUT, "Record A gate (high = recording)");
+		configInput(REC_B_INPUT, "Record B audio (normalled from Record A audio)");
+		configInput(REC_B_GATE_INPUT, "Record B gate (normalled from Record A gate)");
+
 		configOutput(LEFT_OUTPUT, "Left");
 		configOutput(RIGHT_OUTPUT, "Right");
+
+		// Pre-allocate the record buffers once at construction.
+		// This avoids any allocation on the audio thread when recording starts.
+		recA.recBuffer.resize(MAX_REC_LENGTH, 0.f);
+		recB.recBuffer.resize(MAX_REC_LENGTH, 0.f);
 	}
 
 	void onReset() override {
@@ -330,11 +476,29 @@ struct Phase : Module {
 		loopB.jumpTarget = -1.0;
 		loopB.rotationOffset = 0.0;
 
+		// Reset recording state
+		recA.phase = RecState::IDLE;
+		recA.armed = false;
+		recA.writePos = 0;
+		recA.envelope = 0.f;
+		recA.pendingFinalize = false;
+		recA.recordedLength = 0;
+
+		recB.phase = RecState::IDLE;
+		recB.armed = false;
+		recB.writePos = 0;
+		recB.envelope = 0.f;
+		recB.pendingFinalize = false;
+		recB.recordedLength = 0;
+
 		// Reset state
 		playing = false;
 		transientSensitivity = 0.7f;
 		transientMinGapMs = 100.f;
 		vcaMode = true;
+		recordAppend = false;
+		recLink = false;
+		persistRecordedBuffers = true;
 	}
 
 	// --- Sample loading ---
@@ -349,7 +513,7 @@ struct Phase : Module {
 			if (end > sd.length) end = sd.length;
 			float peak = 0.f;
 			for (size_t j = start; j < end; j++) {
-				float v = std::fabs(sd.samples[j]);
+				float v = std::fabs(sampleToFloat(sd.samples[j]));
 				if (v > peak) peak = v;
 			}
 			sd.waveformMini[i] = peak;
@@ -382,11 +546,11 @@ struct Phase : Module {
 			float sum = 0.f;
 			float hfSum = 0.f;
 			for (int j = 0; j < windowSize && offset + j < sd.length; j++) {
-				float v = sd.samples[offset + j];
+				float v = sampleToFloat(sd.samples[offset + j]);
 				sum += v * v;
 				// High-frequency energy via sample differencing
 				if (j > 0) {
-					float diff = v - sd.samples[offset + j - 1];
+					float diff = v - sampleToFloat(sd.samples[offset + j - 1]);
 					hfSum += diff * diff;
 				}
 			}
@@ -441,8 +605,12 @@ struct Phase : Module {
 	}
 
 	void clearSample(SampleData& sd) {
+		// Mark as unloaded FIRST so the audio thread skips reads of sd.samples
+		// while we mutate it. Wait one audio buffer's worth (~5ms) for the
+		// audio thread to see the flag before we reallocate.
+		sd.loaded.store(false);
 #ifndef METAMODULE
-		std::this_thread::sleep_for(std::chrono::duration<double>(100e-6));
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 #endif
 		sd.samples.clear();
 		sd.length = 0;
@@ -450,7 +618,6 @@ struct Phase : Module {
 		sd.fileName.clear();
 		sd.transients.clear();
 		sd.waveformMini.clear();
-		sd.loaded = false;
 		sd.loopStart = 0.f;
 		sd.loopEnd = 1.f;
 		sd.hasCuePoints = false;
@@ -478,11 +645,11 @@ struct Phase : Module {
 			if (wav.pMetadata[m].type == drwav_metadata_type_cue) {
 				drwav_cue* cue = &wav.pMetadata[m].data.cue;
 				for (drwav_uint32 c = 0; c < cue->cuePointCount; c++) {
-					// sampleByteOffset is byte offset into audio data
-					// Convert to frame position
+					// dr_wav's sampleByteOffset is the raw dwSampleOffset, a SAMPLE-FRAME
+					// offset (despite the name) — use it directly so markers match other apps
 					uint32_t bytesPerFrame = channels * (bitsPerSample / 8);
 					if (bytesPerFrame > 0) {
-						size_t framePos = (size_t)(cue->pCuePoints[c].sampleByteOffset / bytesPerFrame);
+						size_t framePos = (size_t)cue->pCuePoints[c].sampleByteOffset;
 						if (framePos < totalFrames) {
 							cuePositions.push_back(framePos);
 						}
@@ -539,16 +706,23 @@ struct Phase : Module {
 			mono.resize(MAX_SAMPLE_LENGTH);
 		}
 
+		// Mark as unloaded so the audio thread skips reads of sd.samples,
+		// then wait one audio buffer's worth (~5ms) before reallocating.
+		sd.loaded.store(false);
 #ifndef METAMODULE
-		// Brief sleep to let DSP thread finish (following Fundamental pattern)
-		std::this_thread::sleep_for(std::chrono::duration<double>(100e-6));
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 #endif
 
+#ifdef METAMODULE
+		// Convert decoded float samples to int16 storage.
+		sd.samples.resize(mono.size());
+		for (size_t i = 0; i < mono.size(); i++) sd.samples[i] = floatToSample(mono[i]);
+#else
 		sd.samples = std::move(mono);
+#endif
 		sd.length = sd.samples.size();
 		sd.filePath = path;
 		sd.fileName = system::getFilename(path);
-		sd.loaded = true;
 		sd.loopStart = 0.f;
 		sd.loopEnd = 1.f;
 
@@ -568,6 +742,9 @@ struct Phase : Module {
 			sd.hasCuePoints = false;
 			detectTransients(sd);
 		}
+
+		// All metadata is now in place; let the audio thread read it again.
+		sd.loaded.store(true);
 	}
 
 	void loadSampleFromPath(const std::string& path, bool isB) {
@@ -576,7 +753,6 @@ struct Phase : Module {
 			sampleBExplicitlyLoaded = true;
 		} else {
 			loadSample(sampleA, path);
-			// Cascade to B if B not explicitly loaded
 			if (!sampleBExplicitlyLoaded) {
 				loadSample(sampleB, path);
 			}
@@ -591,7 +767,6 @@ struct Phase : Module {
 		} else if (!isB && sampleA.loaded) {
 			dir = system::getDirectory(sampleA.filePath);
 		}
-
 		osdialog_filters* filters = osdialog_filters_parse(PHASE_WAV_FILTERS);
 		async_osdialog_file(OSDIALOG_OPEN,
 			dir.empty() ? NULL : dir.c_str(),
@@ -629,6 +804,215 @@ struct Phase : Module {
 	}
 #endif
 
+	// --- Live recording ---
+
+	// Returns true if the loop is currently recording (any phase except IDLE).
+	// While recording, the loop's normal playback is suppressed and a dry
+	// monitor passthrough is sent to the output instead.
+	bool isRecording(const RecState& rec) const {
+		return rec.phase != RecState::IDLE;
+	}
+
+	// Run one sample of the recording state machine for a single buffer.
+	// `audioInput` is the already-normalled audio sample (in volts, ±5V scale).
+	// `wantRecording` is the desired recording state from button + gate logic.
+	// If `appendMode` is true and the buffer already holds a sample, the new
+	// recording is appended to the end of the existing audio rather than
+	// replacing it.
+	void processRecording(RecState& rec, SampleData& sd, float audioInput, bool wantRecording,
+	                      bool appendMode, float sampleTime) {
+		// 1ms ramp = 48 samples at 48kHz
+		float rampRate = sampleTime / 0.001f;
+
+		// State transitions
+		if (wantRecording && rec.phase == RecState::IDLE) {
+			rec.phase = RecState::ARMING;
+			rec.envelope = 0.f;
+
+			// Set initial writePos based on mode + existing content
+			size_t startPos = 0;
+			if (appendMode && sd.loaded && sd.length > 0) {
+				// Copy existing audio into the front of recBuffer so we
+				// continue writing past it. Truncated to MAX_REC_LENGTH.
+				size_t copyLen = std::min(sd.length, rec.recBuffer.size());
+				std::copy(sd.samples.begin(), sd.samples.begin() + copyLen,
+				          rec.recBuffer.begin());
+				startPos = copyLen;
+			}
+			rec.writePos.store(startPos);
+		}
+		else if (!wantRecording && rec.phase == RecState::ACTIVE) {
+			rec.phase = RecState::FINISHING;
+		}
+
+		if (rec.phase == RecState::IDLE) return;
+
+		// Convert from ±5V audio scale to ±1.0 sample value, apply fade envelope
+		float sampleValue = (audioInput / 5.f) * rec.envelope;
+
+		// Write to record buffer (float → PhaseSampleT, which is int16 on MM)
+		size_t pos = rec.writePos.load();
+		if (pos < rec.recBuffer.size()) {
+			rec.recBuffer[pos] = floatToSample(sampleValue);
+			rec.writePos.store(pos + 1);
+		} else {
+			// Buffer full, force end. Skip to FINISHING.
+			rec.phase = RecState::FINISHING;
+		}
+
+		// Update envelope
+		if (rec.phase == RecState::ARMING) {
+			rec.envelope += rampRate;
+			if (rec.envelope >= 1.f) {
+				rec.envelope = 1.f;
+				rec.phase = RecState::ACTIVE;
+			}
+		}
+		else if (rec.phase == RecState::FINISHING) {
+			rec.envelope -= rampRate;
+			if (rec.envelope <= 0.f) {
+				rec.envelope = 0.f;
+				// Hand off to the GUI thread for finalization.
+				rec.recordedLength = rec.writePos.load();
+				rec.pendingFinalize.store(true);
+				rec.phase = RecState::IDLE;
+				rec.armed = false; // reset latch so the LED reflects state
+			}
+		}
+	}
+
+	// Finalize a completed recording: copy the captured audio out of the
+	// pre-allocated record buffer into the playable sample, run waveform and
+	// transient analysis, and reset the loop region.
+	// Called from PhaseWidget::step() on the GUI thread to avoid audio glitches.
+	void finalizeRecording(SampleData& sd, RecState& rec) {
+		if (rec.recordedLength == 0) {
+			rec.recordedLength = 0;
+			return;
+		}
+
+		// Mark as unloaded so the audio thread skips reads of sd.samples,
+		// then wait one audio buffer's worth (~5ms) before reallocating.
+		sd.loaded.store(false);
+#ifndef METAMODULE
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+#endif
+
+		sd.samples.assign(rec.recBuffer.begin(),
+		                  rec.recBuffer.begin() + rec.recordedLength);
+		sd.length = rec.recordedLength;
+		sd.filePath.clear();
+		sd.fileName = "Recorded";
+		sd.loopStart = 0.f;
+		sd.loopEnd = 1.f;
+		sd.hasCuePoints = false;
+
+		computeWaveformMini(sd);
+		detectTransients(sd);
+
+		// Now safe for audio thread to read again
+		sd.loaded.store(true);
+
+		rec.recordedLength = 0;
+	}
+
+	// Adopt an existing in-memory float buffer as a sample. Used for restoring
+	// recorded buffers from the patch JSON. Runs on the GUI thread.
+	void adoptSampleBuffer(SampleData& sd, std::vector<float>&& buf, bool fromRecording) {
+		sd.loaded.store(false);
+#ifndef METAMODULE
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+#endif
+#ifdef METAMODULE
+		// Convert incoming float buffer to int16 storage.
+		size_t n = std::min(buf.size(), MAX_SAMPLE_LENGTH);
+		sd.samples.resize(n);
+		for (size_t i = 0; i < n; i++) sd.samples[i] = floatToSample(buf[i]);
+#else
+		sd.samples = std::move(buf);
+		if (sd.samples.size() > MAX_SAMPLE_LENGTH) sd.samples.resize(MAX_SAMPLE_LENGTH);
+#endif
+		sd.length = sd.samples.size();
+		sd.loopStart = 0.f;
+		sd.loopEnd = 1.f;
+		sd.hasCuePoints = false;
+		if (fromRecording) {
+			sd.filePath.clear();
+			sd.fileName = "Recorded";
+		}
+		computeWaveformMini(sd);
+		detectTransients(sd);
+		sd.loaded.store(true);
+	}
+
+	// Save both buffers as a single stereo WAV: A on the left channel, B on
+	// the right. The shorter buffer is zero-padded so they line up.
+	bool saveStereoWav(const std::string& path) {
+		size_t length = std::max(sampleA.length, sampleB.length);
+		if (length == 0) return false;
+
+		drwav_data_format format = {};
+		format.container = drwav_container_riff;
+		format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+		format.channels = 2;
+		format.sampleRate = 48000;
+		format.bitsPerSample = 32;
+
+		drwav wav;
+		if (!drwav_init_file_write(&wav, path.c_str(), &format, NULL))
+			return false;
+
+		// Interleave A and B in chunks to keep memory use bounded.
+		const size_t CHUNK = 4096;
+		std::vector<float> interleaved(CHUNK * 2);
+		for (size_t i = 0; i < length; i += CHUNK) {
+			size_t n = std::min(CHUNK, length - i);
+			for (size_t j = 0; j < n; j++) {
+				size_t idx = i + j;
+				interleaved[j * 2]     = (idx < sampleA.length) ? sampleToFloat(sampleA.samples[idx]) : 0.f;
+				interleaved[j * 2 + 1] = (idx < sampleB.length) ? sampleToFloat(sampleB.samples[idx]) : 0.f;
+			}
+			drwav_write_pcm_frames(&wav, n, interleaved.data());
+		}
+		drwav_uninit(&wav);
+		return true;
+	}
+
+	static std::string ensureWavExt(std::string path) {
+		if (path.size() < 4 ||
+		    !(path[path.size()-4]=='.' && path[path.size()-3]=='w' &&
+		      path[path.size()-2]=='a' && path[path.size()-1]=='v')) {
+			path += ".wav";
+		}
+		return path;
+	}
+
+#ifdef METAMODULE
+	void saveStereoWavDialog() {
+		osdialog_filters* filters = osdialog_filters_parse(PHASE_WAV_FILTERS);
+		async_osdialog_file(OSDIALOG_SAVE, NULL, "phase-buffers.wav", filters,
+			[this, filters](char* pathC) {
+				if (pathC) {
+					std::string path = ensureWavExt(pathC);
+					std::free(pathC);
+					saveStereoWav(path);
+				}
+				osdialog_filters_free(filters);
+			}
+		);
+	}
+#else
+	void saveStereoWavDialog() {
+		osdialog_filters* filters = osdialog_filters_parse(PHASE_WAV_FILTERS);
+		DEFER({ osdialog_filters_free(filters); });
+		char* pathC = osdialog_file(OSDIALOG_SAVE, NULL, "phase-buffers.wav", filters);
+		if (!pathC) return;
+		std::string path = ensureWavExt(pathC);
+		std::free(pathC);
+		saveStereoWav(path);
+	}
+#endif
+
 	void redetectTransients() {
 		if (sampleA.loaded) {
 			detectTransients(sampleA);
@@ -645,21 +1029,61 @@ struct Phase : Module {
 	json_t* dataToJson() override {
 		json_t* rootJ = json_object();
 
-		if (sampleA.loaded)
-			json_object_set_new(rootJ, "sampleAPath", json_string(sampleA.filePath.c_str()));
-		if (sampleB.loaded)
-			json_object_set_new(rootJ, "sampleBPath", json_string(sampleB.filePath.c_str()));
+		// Persist samples in one of two ways:
+		//  - File-loaded: store the file path. Reload from disk on patch open.
+		//  - Recorded: embed the raw float bytes as base64. Bigger patch files,
+		//    but the recording survives across sessions without leaving stray
+		//    files on the user's disk.
+		auto persistBuffer = [&](const SampleData& sd, const char* pathKey, const char* dataKey) {
+			if (!sd.loaded || sd.length == 0) return;
+			if (!sd.filePath.empty()) {
+				json_object_set_new(rootJ, pathKey, json_string(sd.filePath.c_str()));
+			} else if (persistRecordedBuffers) {
+#ifdef METAMODULE
+				// Convert int16 → float bytes so the patch JSON format stays
+				// cross-compatible with VCV Rack. Otherwise a patch recorded
+				// on MetaModule wouldn't load in VCV and vice-versa.
+				std::vector<float> tmp(sd.length);
+				for (size_t i = 0; i < sd.length; i++) tmp[i] = sampleToFloat(sd.samples[i]);
+				size_t numBytes = tmp.size() * sizeof(float);
+				std::string b64 = base64Encode((const uint8_t*)tmp.data(), numBytes);
+#else
+				size_t numBytes = sd.length * sizeof(float);
+				std::string b64 = base64Encode((const uint8_t*)sd.samples.data(), numBytes);
+#endif
+				json_object_set_new(rootJ, dataKey, json_string(b64.c_str()));
+			}
+		};
+		persistBuffer(sampleA, "sampleAPath", "sampleAData");
+		persistBuffer(sampleB, "sampleBPath", "sampleBData");
 		json_object_set_new(rootJ, "sampleBExplicit", json_boolean(sampleBExplicitlyLoaded));
 		json_object_set_new(rootJ, "playing", json_boolean(playing));
 		json_object_set_new(rootJ, "transientSensitivity", json_real(transientSensitivity));
 		json_object_set_new(rootJ, "transientMinGapMs", json_real(transientMinGapMs));
 		json_object_set_new(rootJ, "vcaMode", json_boolean(vcaMode));
+		json_object_set_new(rootJ, "recordAppend", json_boolean(recordAppend));
+		json_object_set_new(rootJ, "recLink", json_boolean(recLink));
+		json_object_set_new(rootJ, "persistRecordedBuffers", json_boolean(persistRecordedBuffers));
 
 		// Loop regions
 		json_object_set_new(rootJ, "loopStartA", json_real(sampleA.loopStart));
 		json_object_set_new(rootJ, "loopEndA", json_real(sampleA.loopEnd));
 		json_object_set_new(rootJ, "loopStartB", json_real(sampleB.loopStart));
 		json_object_set_new(rootJ, "loopEndB", json_real(sampleB.loopEnd));
+
+		// Manually-edited cue points (override the file-derived transients on
+		// reload). Only persisted once the user has edited them.
+		auto saveCues = [&](SampleData& sd, const char* flagKey, const char* arrKey) {
+			if (!sd.cuesEdited) return;
+			json_object_set_new(rootJ, flagKey, json_boolean(true));
+			json_t* arr = json_array();
+			std::lock_guard<std::mutex> lk(cueMutex);
+			for (size_t t : sd.transients)
+				json_array_append_new(arr, json_integer((json_int_t)t));
+			json_object_set_new(rootJ, arrKey, arr);
+		};
+		saveCues(sampleA, "cuesEditedA", "cuesA");
+		saveCues(sampleB, "cuesEditedB", "cuesB");
 
 		return rootJ;
 	}
@@ -683,8 +1107,34 @@ struct Phase : Module {
 		json_t* vcaJ = json_object_get(rootJ, "vcaMode");
 		if (vcaJ)
 			vcaMode = json_boolean_value(vcaJ);
+		json_t* appendJ = json_object_get(rootJ, "recordAppend");
+		if (appendJ)
+			recordAppend = json_boolean_value(appendJ);
+		json_t* linkJ = json_object_get(rootJ, "recLink");
+		if (linkJ)
+			recLink = json_boolean_value(linkJ);
+		json_t* persistJ = json_object_get(rootJ, "persistRecordedBuffers");
+		if (persistJ)
+			persistRecordedBuffers = json_boolean_value(persistJ);
 
-		if (pathAJ) {
+		// Restore embedded recorded-buffer data (preferred over path: a file
+		// load would clobber the recorded audio if both somehow appeared).
+		auto restoreEmbedded = [&](SampleData& sd, const char* dataKey) -> bool {
+			json_t* dataJ = json_object_get(rootJ, dataKey);
+			if (!dataJ) return false;
+			std::string b64 = json_string_value(dataJ);
+			std::vector<uint8_t> bytes = base64Decode(b64);
+			size_t numFloats = bytes.size() / sizeof(float);
+			if (numFloats == 0) return false;
+			std::vector<float> samples(numFloats);
+			std::memcpy(samples.data(), bytes.data(), numFloats * sizeof(float));
+			adoptSampleBuffer(sd, std::move(samples), true);
+			return true;
+		};
+		bool aRestored = restoreEmbedded(sampleA, "sampleAData");
+		bool bRestored = restoreEmbedded(sampleB, "sampleBData");
+
+		if (!aRestored && pathAJ) {
 			std::string path = json_string_value(pathAJ);
 #ifdef METAMODULE
 			path = MetaModule::Filesystem::translate_path_to_local(path, MetaModule::Patch::get_dir());
@@ -692,14 +1142,16 @@ struct Phase : Module {
 			loadSample(sampleA, path);
 		}
 
-		if (pathBJ) {
-			std::string path = json_string_value(pathBJ);
+		if (!bRestored) {
+			if (pathBJ) {
+				std::string path = json_string_value(pathBJ);
 #ifdef METAMODULE
-			path = MetaModule::Filesystem::translate_path_to_local(path, MetaModule::Patch::get_dir());
+				path = MetaModule::Filesystem::translate_path_to_local(path, MetaModule::Patch::get_dir());
 #endif
-			loadSample(sampleB, path);
-		} else if (sampleA.loaded && !sampleBExplicitlyLoaded) {
-			loadSample(sampleB, sampleA.filePath);
+				loadSample(sampleB, path);
+			} else if (sampleA.loaded && !sampleBExplicitlyLoaded && !sampleA.filePath.empty()) {
+				loadSample(sampleB, sampleA.filePath);
+			}
 		}
 
 		// Restore loop regions
@@ -711,6 +1163,28 @@ struct Phase : Module {
 		if (leA) sampleA.loopEnd = (float)json_real_value(leA);
 		if (lsB) sampleB.loopStart = (float)json_real_value(lsB);
 		if (leB) sampleB.loopEnd = (float)json_real_value(leB);
+
+		// Restore manually-edited cues, overriding the file-derived transients
+		// that loadSample() just produced above.
+		auto restoreCues = [&](SampleData& sd, const char* flagKey, const char* arrKey) {
+			json_t* flagJ = json_object_get(rootJ, flagKey);
+			if (!flagJ || !json_boolean_value(flagJ)) return;
+			json_t* arr = json_object_get(rootJ, arrKey);
+			std::lock_guard<std::mutex> lk(cueMutex);
+			sd.transients.clear();
+			if (arr) {
+				size_t n = json_array_size(arr);
+				for (size_t i = 0; i < n; i++) {
+					size_t t = (size_t)json_integer_value(json_array_get(arr, i));
+					if (t < sd.length) sd.transients.push_back(t);
+				}
+			}
+			std::sort(sd.transients.begin(), sd.transients.end());
+			sd.cuesEdited = true;
+			sd.hasCuePoints = !sd.transients.empty();
+		};
+		restoreCues(sampleA, "cuesEditedA", "cuesA");
+		restoreCues(sampleB, "cuesEditedB", "cuesB");
 	}
 
 	// --- DSP ---
@@ -718,7 +1192,20 @@ struct Phase : Module {
 	float processLoop(LoopState& loop, SampleData& sd,
 	                   float sleepMs, float speed, float pan,
 	                   bool rotateMode, float sampleTime,
-	                   float& leftOut, float& rightOut) {
+	                   float& leftOut, float& rightOut,
+	                   bool recording = false, float monitorAudio = 0.f) {
+		// While recording, suppress loop playback and pass through the dry
+		// monitor signal at the buffer's current pan position. This lets the
+		// user hear what they're tracking without any feedback risk.
+		if (recording) {
+			float panNorm = (pan + 1.f) * 0.5f;
+			float leftGain = std::cos(panNorm * M_PI * 0.5f);
+			float rightGain = std::sin(panNorm * M_PI * 0.5f);
+			leftOut += monitorAudio * leftGain;
+			rightOut += monitorAudio * rightGain;
+			return monitorAudio;
+		}
+
 		if (!sd.loaded || sd.length == 0) return 0.f;
 
 		// VCA mode envelope: 1ms ramp = 48 samples at 48kHz
@@ -784,19 +1271,22 @@ struct Phase : Module {
 			size_t idx = (size_t)readPos;
 			float frac = (float)(readPos - (double)idx);
 			if (idx < sd.length) {
-				float s0 = sd.samples[idx];
+				float s0 = sampleToFloat(sd.samples[idx]);
 				size_t idx1 = idx + 1;
 				if (idx1 >= regionEnd) idx1 = regionStart;
-				float s1 = (idx1 < sd.length) ? sd.samples[idx1] : s0;
+				float s1 = (idx1 < sd.length) ? sampleToFloat(sd.samples[idx1]) : s0;
 				sample = s0 + (s1 - s0) * frac;
 			}
 
-			// Advance playhead at base speed
-			loop.playhead += std::fabs((double)speed);
+			// Advance playhead at base speed (signed, so negative speed
+			// reverses the playhead direction in rotate mode too).
+			loop.playhead += (double)speed;
 
-			// Wrap playhead at loop boundary
+			// Wrap playhead at loop boundary in either direction.
 			if (loop.playhead >= (double)regionEnd) {
 				loop.playhead = (double)regionStart + (loop.playhead - (double)regionEnd);
+			} else if (loop.playhead < (double)regionStart) {
+				loop.playhead = (double)regionEnd - ((double)regionStart - loop.playhead);
 			}
 
 			// Accumulate drift continuously (no discrete jumps)
@@ -835,8 +1325,8 @@ struct Phase : Module {
 				float frac = (float)(loop.playhead - (double)idx);
 
 				if (idx < sd.length) {
-					float s0 = sd.samples[idx];
-					float s1 = (idx + 1 < sd.length) ? sd.samples[idx + 1] : sd.samples[idx];
+					float s0 = sampleToFloat(sd.samples[idx]);
+					float s1 = (idx + 1 < sd.length) ? sampleToFloat(sd.samples[idx + 1]) : s0;
 					sample = s0 + (s1 - s0) * frac;
 				}
 
@@ -914,7 +1404,52 @@ struct Phase : Module {
 		}
 	}
 
+	// Guards sd.transients against concurrent edits (UI thread) while the
+	// audio thread reads them on clock edges. UI edits take a full lock; the
+	// audio reader takes a try-lock and simply skips the jump if it's busy.
+	std::mutex cueMutex;
+
+	// --- Manual cue editing (UI thread) ---
+	void addCue(SampleData& sd, size_t frame) {
+		if (!sd.loaded || sd.length == 0) return;
+		if (frame >= sd.length) frame = sd.length - 1;
+		std::lock_guard<std::mutex> lk(cueMutex);
+		sd.transients.push_back(frame);
+		std::sort(sd.transients.begin(), sd.transients.end());
+		sd.cuesEdited = true;
+		sd.hasCuePoints = true;
+	}
+	void removeCue(SampleData& sd, int idx) {
+		std::lock_guard<std::mutex> lk(cueMutex);
+		if (idx >= 0 && idx < (int)sd.transients.size())
+			sd.transients.erase(sd.transients.begin() + idx);
+		sd.cuesEdited = true;
+	}
+	// Move one cue by index without re-sorting (called continuously during a
+	// drag; sortCues() is called once on drag end to restore order).
+	void moveCue(SampleData& sd, int idx, size_t frame) {
+		if (sd.length == 0) return;
+		if (frame >= sd.length) frame = sd.length - 1;
+		std::lock_guard<std::mutex> lk(cueMutex);
+		if (idx >= 0 && idx < (int)sd.transients.size())
+			sd.transients[idx] = frame;
+	}
+	void sortCues(SampleData& sd) {
+		std::lock_guard<std::mutex> lk(cueMutex);
+		std::sort(sd.transients.begin(), sd.transients.end());
+		sd.cuesEdited = true;
+	}
+	void clearCues(SampleData& sd) {
+		std::lock_guard<std::mutex> lk(cueMutex);
+		sd.transients.clear();
+		sd.cuesEdited = true;
+		sd.hasCuePoints = false;
+	}
+
 	double findNextTransient(const LoopState& loop, const SampleData& sd) {
+		// Skip the jump rather than block audio if the UI is mid-edit.
+		std::unique_lock<std::mutex> lk(cueMutex, std::try_to_lock);
+		if (!lk.owns_lock()) return -1.0;
 		if (sd.transients.empty()) return -1.0;
 
 		size_t currentPos = (size_t)loop.playhead;
@@ -961,8 +1496,54 @@ struct Phase : Module {
 		// Update play LED
 		lights[PLAY_LIGHT].setBrightness(isPlaying ? 1.f : 0.f);
 
-		// If not playing, output silence
-		if (!isPlaying) {
+		// --- Recording control (runs regardless of play state) ---
+		// Recording must work whether or not the module is playing back.
+		// LINK button is a latch: each click toggles the link state.
+		if (params[REC_LINK_PARAM].getValue() > 0.f) {
+			params[REC_LINK_PARAM].setValue(0.f);
+			recLink = !recLink;
+		}
+		// Toggle armed state on momentary button press. When LINK is on,
+		// pressing either REC button toggles both at once.
+		if (params[REC_A_PARAM].getValue() > 0.f) {
+			params[REC_A_PARAM].setValue(0.f);
+			recA.armed = !recA.armed;
+			if (recLink) recB.armed = recA.armed;
+		}
+		if (params[REC_B_PARAM].getValue() > 0.f) {
+			params[REC_B_PARAM].setValue(0.f);
+			recB.armed = !recB.armed;
+			if (recLink) recA.armed = recB.armed;
+		}
+
+		// Audio in: REC B INPUT normalled from REC A INPUT (cascade)
+		float recAudioA = inputs[REC_A_INPUT].getVoltage();
+		float recAudioB = inputs[REC_B_INPUT].getNormalVoltage(recAudioA);
+
+		// Gate logic: record if button is armed OR gate input is high.
+		// Either source can independently drive recording. REC B GATE is
+		// normalled from REC A GATE so a single gate cable cascades to both.
+		bool wantRecA = recA.armed;
+		if (inputs[REC_A_GATE_INPUT].isConnected()) {
+			wantRecA = wantRecA || (inputs[REC_A_GATE_INPUT].getVoltage() >= 1.f);
+		}
+		bool wantRecB = recB.armed;
+		if (inputs[REC_B_GATE_INPUT].isConnected()) {
+			wantRecB = wantRecB || (inputs[REC_B_GATE_INPUT].getVoltage() >= 1.f);
+		} else if (inputs[REC_A_GATE_INPUT].isConnected()) {
+			// Normalled from REC A GATE
+			wantRecB = wantRecB || (inputs[REC_A_GATE_INPUT].getVoltage() >= 1.f);
+		}
+
+		processRecording(recA, sampleA, recAudioA, wantRecA, recordAppend, args.sampleTime);
+		processRecording(recB, sampleB, recAudioB, wantRecB, recordAppend, args.sampleTime);
+
+		lights[REC_A_LIGHT].setBrightness(isRecording(recA) ? 1.f : (recA.armed ? 0.5f : 0.f));
+		lights[REC_B_LIGHT].setBrightness(isRecording(recB) ? 1.f : (recB.armed ? 0.5f : 0.f));
+		lights[REC_LINK_LIGHT].setBrightness(recLink ? 1.f : 0.f);
+
+		// If not playing AND not recording on either buffer, output silence and skip the rest
+		if (!isPlaying && !isRecording(recA) && !isRecording(recB)) {
 			outputs[LEFT_OUTPUT].setVoltage(0.f);
 			outputs[RIGHT_OUTPUT].setVoltage(0.f);
 			return;
@@ -997,10 +1578,10 @@ struct Phase : Module {
 			sleepA += inputs[SLEEP_A_INPUT].getVoltage() * 50.f;
 		sleepA = clamp(sleepA, -500.f, 500.f);
 
-		// Speed A: -4x to +4x, CV at 0.8x/V
+		// Speed A: -4x to +4x, CV at 1.0x/V (so ±4V CV = ±4× exactly)
 		float speedA = params[SPEED_A_PARAM].getValue();
 		if (inputs[SPEED_A_INPUT].isConnected())
-			speedA += inputs[SPEED_A_INPUT].getVoltage() * 0.8f;
+			speedA += inputs[SPEED_A_INPUT].getVoltage() * 1.0f;
 		speedA = clamp(speedA, -4.f, 4.f);
 
 		// Pan A: -1 to +1, CV at 0.2/V
@@ -1015,10 +1596,10 @@ struct Phase : Module {
 			sleepB += inputs[SLEEP_B_INPUT].getVoltage() * 50.f;
 		sleepB = clamp(sleepB, -500.f, 500.f);
 
-		// Speed B: -4x to +4x, CV at 0.8x/V
+		// Speed B: -4x to +4x, CV at 1.0x/V
 		float speedB = params[SPEED_B_PARAM].getValue();
 		if (inputs[SPEED_B_INPUT].isConnected())
-			speedB += inputs[SPEED_B_INPUT].getVoltage() * 0.8f;
+			speedB += inputs[SPEED_B_INPUT].getVoltage() * 1.0f;
 		speedB = clamp(speedB, -4.f, 4.f);
 
 		// Pan B
@@ -1059,8 +1640,18 @@ struct Phase : Module {
 		bool rotateModeA = params[MODE_A_PARAM].getValue() < 0.5f;
 		bool rotateModeB = params[MODE_B_PARAM].getValue() < 0.5f;
 
-		processLoop(loopA, sampleA, sleepA, speedA, panA, rotateModeA, args.sampleTime, leftOut, rightOut);
-		processLoop(loopB, sampleB, sleepB, speedB, panB, rotateModeB, args.sampleTime, leftOut, rightOut);
+		// While recording, the monitor audio is the post-fade input value
+		float monitorA = recAudioA * recA.envelope;
+		float monitorB = recAudioB * recB.envelope;
+
+		// If not playing but recording, run the loop function only for monitor
+		// passthrough on the recording buffer. Don't advance/play the other buffer.
+		if (isPlaying || isRecording(recA))
+			processLoop(loopA, sampleA, sleepA, speedA, panA, rotateModeA, args.sampleTime, leftOut, rightOut,
+			            isRecording(recA), monitorA);
+		if (isPlaying || isRecording(recB))
+			processLoop(loopB, sampleB, sleepB, speedB, panB, rotateModeB, args.sampleTime, leftOut, rightOut,
+			            isRecording(recB), monitorB);
 
 		// Clamp output
 		outputs[LEFT_OUTPUT].setVoltage(clamp(leftOut, -10.f, 10.f));
@@ -1097,15 +1688,65 @@ PhaseWaveformDisplay::DragTarget PhaseWaveformDisplay::hitTestHandle(Vec pos) {
 	return NONE;
 }
 
+int PhaseWaveformDisplay::hitTestCue(Vec pos, bool& isB) {
+	if (!module) return -1;
+	float w = box.size.x;
+	float halfH = box.size.y * 0.5f;
+	float hitRadius = 4.f;
+	isB = pos.y >= halfH;
+	SampleData& sd = isB ? module->sampleB : module->sampleA;
+	if (!sd.loaded || sd.length == 0) return -1;
+	int best = -1;
+	float bestDist = hitRadius;
+	for (int i = 0; i < (int)sd.transients.size(); i++) {
+		float px = (float)sd.transients[i] / (float)sd.length * w;
+		float d = std::fabs(pos.x - px);
+		if (d < bestDist) { bestDist = d; best = i; }
+	}
+	return best;
+}
+
 void PhaseWaveformDisplay::onButton(const ButtonEvent& e) {
 	if (e.action == GLFW_PRESS && e.button == GLFW_MOUSE_BUTTON_LEFT) {
+		lastButtonPos = e.pos;
+		// Loop handles take priority, then existing cues (for dragging).
 		dragTarget = hitTestHandle(e.pos);
-		if (dragTarget != NONE) {
-			APP->event->setSelectedWidget(this);
-			e.consume(this);
+		dragCueIdx = -1;
+		if (dragTarget == NONE) {
+			bool isB = false;
+			int cue = hitTestCue(e.pos, isB);
+			if (cue >= 0) {
+				dragTarget = isB ? CUE_B : CUE_A;
+				dragCueIdx = cue;
+			}
 		}
+		// Consume all left presses on the display so we also receive the
+		// double-click that follows (add/remove cue). Right-click is left
+		// untouched so VCV's context menu still opens.
+		APP->event->setSelectedWidget(this);
+		e.consume(this);
 	}
 	Widget::onButton(e);
+}
+
+void PhaseWaveformDisplay::onDoubleClick(const DoubleClickEvent& e) {
+	if (!module) return;
+	// Don't drop a cue when double-clicking a loop handle.
+	if (hitTestHandle(lastButtonPos) != NONE) return;
+	float w = box.size.x;
+	float halfH = box.size.y * 0.5f;
+	bool isB = lastButtonPos.y >= halfH;
+	SampleData& sd = isB ? module->sampleB : module->sampleA;
+	if (!sd.loaded || sd.length == 0) return;
+
+	bool hitIsB = false;
+	int cue = hitTestCue(lastButtonPos, hitIsB);
+	if (cue >= 0 && hitIsB == isB) {
+		module->removeCue(sd, cue);          // double-click a cue → remove it
+	} else {
+		float norm = clamp(lastButtonPos.x / w, 0.f, 1.f);
+		module->addCue(sd, (size_t)(norm * sd.length));   // double-click empty → add
+	}
 }
 
 void PhaseWaveformDisplay::onDragMove(const DragMoveEvent& e) {
@@ -1129,21 +1770,104 @@ void PhaseWaveformDisplay::onDragMove(const DragMoveEvent& e) {
 		case LOOP_END_B:
 			module->sampleB.loopEnd = clamp(module->sampleB.loopEnd + delta, module->sampleB.loopStart + 0.01f, 1.f);
 			break;
+		case CUE_A: {
+			SampleData& sd = module->sampleA;
+			if (sd.length == 0 || dragCueIdx < 0 || dragCueIdx >= (int)sd.transients.size()) break;
+			float cur = (float)sd.transients[dragCueIdx] / (float)sd.length;
+			float n = clamp(cur + delta, 0.f, 1.f);
+			module->moveCue(sd, dragCueIdx, (size_t)(n * sd.length));
+			break;
+		}
+		case CUE_B: {
+			SampleData& sd = module->sampleB;
+			if (sd.length == 0 || dragCueIdx < 0 || dragCueIdx >= (int)sd.transients.size()) break;
+			float cur = (float)sd.transients[dragCueIdx] / (float)sd.length;
+			float n = clamp(cur + delta, 0.f, 1.f);
+			module->moveCue(sd, dragCueIdx, (size_t)(n * sd.length));
+			break;
+		}
 		default:
 			break;
 	}
 }
 
 void PhaseWaveformDisplay::onDragEnd(const DragEndEvent& e) {
+	// Re-sort after a cue drag so findNextTransient() stays in order.
+	if (dragTarget == CUE_A) module->sortCues(module->sampleA);
+	else if (dragTarget == CUE_B) module->sortCues(module->sampleB);
 	dragTarget = NONE;
+	dragCueIdx = -1;
 }
 
 
 // --- Waveform display drawLayer implementation ---
 
+// Build a peak-amplitude mini waveform from the live record buffer.
+// Used to render the in-progress recording on the display. Stride-samples
+// within each bin so it stays cheap to compute every frame.
+static std::vector<float> buildLiveRecMini(const std::vector<PhaseSampleT>& buf, size_t writePos) {
+	std::vector<float> mini(WAVEFORM_POINTS, 0.f);
+	if (writePos == 0) return mini;
+	for (int i = 0; i < WAVEFORM_POINTS; i++) {
+		size_t binStart = (size_t)((double)i / WAVEFORM_POINTS * writePos);
+		size_t binEnd = (size_t)((double)(i + 1) / WAVEFORM_POINTS * writePos);
+		if (binEnd > writePos) binEnd = writePos;
+		if (binEnd <= binStart) continue;
+		size_t step = std::max((size_t)1, (binEnd - binStart) / 16);
+		float peak = 0.f;
+		for (size_t j = binStart; j < binEnd; j += step) {
+			float v = std::fabs(sampleToFloat(buf[j]));
+			if (v > peak) peak = v;
+		}
+		mini[i] = peak;
+	}
+	return mini;
+}
+
 void PhaseWaveformDisplay::drawLayer(const DrawArgs& args, int layer) {
-	if (layer != 1 || !module) {
+	if (layer != 1) {
 		Widget::drawLayer(args, layer);
+		return;
+	}
+	if (!module) {
+		// Browser-preview render: synthesize two stylized mini waveforms (top =
+		// blue, bottom = orange) with loop handles drawn at sensible positions
+		// so the VCV Library screenshot shows what Phase looks like loaded.
+		float w = box.size.x;
+		float h = box.size.y;
+		float halfH = h * 0.5f;
+		NVGcolor colorA = nvgRGBA(100, 180, 255, 200);
+		NVGcolor colorB = nvgRGBA(255, 140, 80, 200);
+		NVGcolor handleColorA = nvgRGBA(200, 220, 255, 255);
+		NVGcolor handleColorB = nvgRGBA(255, 200, 160, 255);
+
+		// Synthesize amplitude envelopes: A = decaying drum-like, B = sustained pad-like
+		const int N = 128;
+		std::vector<float> miniA(N), miniB(N);
+		for (int i = 0; i < N; i++) {
+			float t = (float)i / (float)(N - 1);
+			// A: percussive shape (fast attack, exp decay), with sub-detail
+			miniA[i] = std::exp(-t * 4.f) * (0.4f + 0.5f * std::sin(t * 40.f));
+			// B: sustained shape, slow envelope
+			miniB[i] = (0.6f + 0.3f * std::sin(t * 18.f)) * std::sin(t * (float)M_PI);
+		}
+		drawWaveform(args, miniA, 0, 0,     w, halfH, 0.1f, 0.85f, colorA, 0.f);
+		drawWaveform(args, miniB, 0, halfH, w, halfH, 0.05f, 0.9f, colorB, 0.f);
+		// Loop handles
+		drawHandle(args, 0.1f,  0, 0,     w, halfH, handleColorA, true);
+		drawHandle(args, 0.85f, 0, 0,     w, halfH, handleColorA, false);
+		drawHandle(args, 0.05f, 0, halfH, w, halfH, handleColorB, true);
+		drawHandle(args, 0.9f,  0, halfH, w, halfH, handleColorB, false);
+		// Playheads (mid-loop on each)
+		NVGcolor playColor = nvgRGBA(255, 255, 255, 220);
+		float pxA = 0.45f * w;
+		nvgBeginPath(args.vg);
+		nvgMoveTo(args.vg, pxA, 0); nvgLineTo(args.vg, pxA, halfH);
+		nvgStrokeColor(args.vg, playColor); nvgStrokeWidth(args.vg, 1.5f); nvgStroke(args.vg);
+		float pxB = 0.6f * w;
+		nvgBeginPath(args.vg);
+		nvgMoveTo(args.vg, pxB, halfH); nvgLineTo(args.vg, pxB, h);
+		nvgStrokeColor(args.vg, playColor); nvgStrokeWidth(args.vg, 1.5f); nvgStroke(args.vg);
 		return;
 	}
 
@@ -1160,9 +1884,45 @@ void PhaseWaveformDisplay::drawLayer(const DrawArgs& args, int layer) {
 	NVGcolor handleColorB = nvgRGBA(255, 200, 160, 255);
 
 	NVGcolor originColor = nvgRGBA(255, 255, 255, 50);
+	// Bright red for live recording display
+	NVGcolor recordingColor = nvgRGBA(255, 60, 60, 220);
+	NVGcolor recordHeadColor = nvgRGBA(255, 80, 80, 255);
 
-	// Draw waveform A (top half)
-	if (module->sampleA.loaded) {
+	// --- Live recording display takes precedence over loaded waveform ---
+	bool recordingA = module->recA.phase != RecState::IDLE;
+	bool recordingB = module->recB.phase != RecState::IDLE;
+
+	if (recordingA) {
+		size_t pos = module->recA.writePos.load();
+		std::vector<float> liveMini = buildLiveRecMini(module->recA.recBuffer, pos);
+		drawWaveform(args, liveMini, 0, 0, w, halfH, 0.f, 1.f, recordingColor, 0.f);
+		// Recording playhead at current position (normalized to recBuffer capacity)
+		float headNorm = (float)pos / (float)module->recA.recBuffer.size();
+		float headPx = headNorm * w;
+		nvgBeginPath(args.vg);
+		nvgMoveTo(args.vg, headPx, 0);
+		nvgLineTo(args.vg, headPx, halfH);
+		nvgStrokeColor(args.vg, recordHeadColor);
+		nvgStrokeWidth(args.vg, 1.5f);
+		nvgStroke(args.vg);
+	}
+
+	if (recordingB) {
+		size_t pos = module->recB.writePos.load();
+		std::vector<float> liveMini = buildLiveRecMini(module->recB.recBuffer, pos);
+		drawWaveform(args, liveMini, 0, halfH, w, halfH, 0.f, 1.f, recordingColor, 0.f);
+		float headNorm = (float)pos / (float)module->recB.recBuffer.size();
+		float headPx = headNorm * w;
+		nvgBeginPath(args.vg);
+		nvgMoveTo(args.vg, headPx, halfH);
+		nvgLineTo(args.vg, headPx, h);
+		nvgStrokeColor(args.vg, recordHeadColor);
+		nvgStrokeWidth(args.vg, 1.5f);
+		nvgStroke(args.vg);
+	}
+
+	// Draw waveform A (top half) — only if not recording
+	if (!recordingA && module->sampleA.loaded) {
 		// Compute rotation as normalized fraction of total sample
 		float rotNormA = 0.f;
 		if (module->params[Phase::MODE_A_PARAM].getValue() < 0.5f && module->sampleA.length > 0) {
@@ -1204,8 +1964,8 @@ void PhaseWaveformDisplay::drawLayer(const DrawArgs& args, int layer) {
 		drawHandle(args, module->sampleA.loopEnd, 0, 0, w, halfH, handleColorA, false);
 	}
 
-	// Draw waveform B (bottom half)
-	if (module->sampleB.loaded) {
+	// Draw waveform B (bottom half) — only if not recording
+	if (!recordingB && module->sampleB.loaded) {
 		float rotNormB = 0.f;
 		if (module->params[Phase::MODE_B_PARAM].getValue() < 0.5f && module->sampleB.length > 0) {
 			rotNormB = (float)(module->loopB.rotationOffset / (double)module->sampleB.length);
@@ -1250,15 +2010,31 @@ void PhaseWaveformDisplay::drawLayer(const DrawArgs& args, int layer) {
 // --- Widget ---
 
 struct PhaseWidget : ModuleWidget {
+	// GUI-thread tick: finalize any pending recordings off the audio thread.
+	// The audio thread sets pendingFinalize when a recording completes (after
+	// fade-out); we do the heavy lifting (vector copy, waveform mini, transient
+	// detection) here so it doesn't glitch playback.
+	void step() override {
+		ModuleWidget::step();
+		Phase* phase = dynamic_cast<Phase*>(this->module);
+		if (!phase) return;
+		if (phase->recA.pendingFinalize.load()) {
+			phase->finalizeRecording(phase->sampleA, phase->recA);
+			phase->recA.pendingFinalize.store(false);
+		}
+		if (phase->recB.pendingFinalize.load()) {
+			phase->finalizeRecording(phase->sampleB, phase->recB);
+			phase->recB.pendingFinalize.store(false);
+			// Recording into B counts as an explicit load — don't let a
+			// subsequent Sample A file load cascade-overwrite it.
+			phase->sampleBExplicitlyLoaded = true;
+		}
+	}
+
 	PhaseWidget(Phase* module) {
 		setModule(module);
 		setPanel(createPanel(asset::plugin(pluginInstance, "res/phase.svg")));
 
-		// Screws
-		addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
-		addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
-		addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
-		addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
 		// Waveform display
 		PhaseWaveformDisplay* display = new PhaseWaveformDisplay();
@@ -1315,9 +2091,63 @@ struct PhaseWidget : ModuleWidget {
 		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(10.16f, 116.84f)), module, Phase::PLAY_INPUT));
 		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(20.32f, 116.84f)), module, Phase::SYNC_INPUT));
 
+		// Record + link buttons (Y=106.68mm — same row as PLAY/SYNC).
+		// Buttons sit above the record jack row: REC A over GATE A (left),
+		// LINK over the pair of audio ins (middle), REC B over GATE B (right).
+		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
+			mm2px(Vec(35.56f, 106.68f)), module, Phase::REC_A_PARAM, Phase::REC_A_LIGHT));
+		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<YellowLight>>>(
+			mm2px(Vec(50.79f, 106.68f)), module, Phase::REC_LINK_PARAM, Phase::REC_LINK_LIGHT));
+		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
+			mm2px(Vec(66.03f, 106.68f)), module, Phase::REC_B_PARAM, Phase::REC_B_LIGHT));
+
+		// Record jacks (Y=116.84mm). New layout: gates on the outside,
+		// audio inputs sandwiched in the middle.
+		// Order (left → right): GATE A · A IN · B IN · GATE B
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(35.56f, 116.84f)), module, Phase::REC_A_GATE_INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(45.72f, 116.84f)), module, Phase::REC_A_INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(55.88f, 116.84f)), module, Phase::REC_B_INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(66.13f, 116.84f)), module, Phase::REC_B_GATE_INPUT));
+
 		// Stereo outputs (Y=116.84mm)
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(78.74f, 116.84f)), module, Phase::LEFT_OUTPUT));
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(88.9f, 116.84f)), module, Phase::RIGHT_OUTPUT));
+	}
+
+	// Drag-and-drop WAV files onto the module to load samples. Dropping two
+	// files loads A and B; dropping one loads A (cascading to B), unless it's
+	// dropped on the lower half of the waveform display, which targets B.
+	void onPathDrop(const PathDropEvent& e) override {
+		Phase* phase = dynamic_cast<Phase*>(this->module);
+		if (!phase) { ModuleWidget::onPathDrop(e); return; }
+
+		std::vector<std::string> wavs;
+		for (const std::string& p : e.paths)
+			if (string::endsWith(string::lowercase(p), ".wav")) wavs.push_back(p);
+		if (wavs.empty()) { ModuleWidget::onPathDrop(e); return; }
+
+		if (wavs.size() >= 2) {
+			phase->loadSample(phase->sampleA, wavs[0]);
+			phase->loadSample(phase->sampleB, wavs[1]);
+			phase->sampleBExplicitlyLoaded = true;
+			e.consume(this);
+			return;
+		}
+
+		// Single file: lower half of the display targets B, otherwise A.
+		Rect disp;
+		disp.pos  = mm2px(Vec(2.54f, 14.f));
+		disp.size = mm2px(Vec(91.44f, 24.f));
+		bool toB = disp.contains(e.pos) && e.pos.y > disp.pos.y + disp.size.y * 0.5f;
+		if (toB) {
+			phase->loadSample(phase->sampleB, wavs[0]);
+			phase->sampleBExplicitlyLoaded = true;
+		} else {
+			phase->loadSample(phase->sampleA, wavs[0]);
+			if (!phase->sampleBExplicitlyLoaded)
+				phase->loadSample(phase->sampleB, wavs[0]);
+		}
+		e.consume(this);
 	}
 
 	void appendContextMenu(Menu* menu) override {
@@ -1357,6 +2187,26 @@ struct PhaseWidget : ModuleWidget {
 				}
 			));
 		}
+		if (module->sampleA.loaded || module->sampleB.loaded) {
+			menu->addChild(createMenuItem("Clear A&B", "",
+				[=]() {
+					module->clearSample(module->sampleA);
+					module->clearSample(module->sampleB);
+					module->sampleBExplicitlyLoaded = false;
+				}
+			));
+		}
+
+		// Cue points (manual editing)
+		menu->addChild(new MenuSeparator);
+		menu->addChild(createMenuLabel("Cue Points"));
+		menu->addChild(createMenuLabel("(double-click waveform to add/remove, drag to move)"));
+		if (module->sampleA.loaded)
+			menu->addChild(createMenuItem("Clear cue points A", "",
+				[=]() { module->clearCues(module->sampleA); }));
+		if (module->sampleB.loaded)
+			menu->addChild(createMenuItem("Clear cue points B", "",
+				[=]() { module->clearCues(module->sampleB); }));
 
 		// Transient detection settings
 		menu->addChild(new MenuSeparator);
@@ -1401,6 +2251,29 @@ struct PhaseWidget : ModuleWidget {
 		menu->addChild(new MenuSeparator);
 		menu->addChild(createBoolPtrMenuItem("VCA Mode (anti-click)", "",
 			&module->vcaMode));
+
+		// Recording mode
+		menu->addChild(new MenuSeparator);
+		menu->addChild(createMenuLabel("Recording"));
+		menu->addChild(createCheckMenuItem("Replace existing audio", "",
+			[=]() { return !module->recordAppend; },
+			[=]() { module->recordAppend = false; }
+		));
+		menu->addChild(createCheckMenuItem("Append to existing audio", "",
+			[=]() { return module->recordAppend; },
+			[=]() { module->recordAppend = true; }
+		));
+		menu->addChild(createBoolPtrMenuItem("Save recordings with patch", "",
+			&module->persistRecordedBuffers));
+
+		// Export
+		menu->addChild(new MenuSeparator);
+		bool hasContent = (module->sampleA.loaded && module->sampleA.length > 0)
+		               || (module->sampleB.loaded && module->sampleB.length > 0);
+		MenuItem* saveItem = createMenuItem("Save buffers as stereo WAV…", "",
+			[=]() { module->saveStereoWavDialog(); });
+		saveItem->disabled = !hasContent;
+		menu->addChild(saveItem);
 	}
 };
 

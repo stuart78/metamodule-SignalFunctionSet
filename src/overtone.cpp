@@ -76,6 +76,9 @@ struct Overtone : Module {
 	bool harmonicTarget[NUM_OVERTONES] = {true, true, true, true, true, true, true, true};
 	bool harmonicActive[NUM_OVERTONES] = {true, true, true, true, true, true, true, true};
 	float prevHarmonicSample[NUM_OVERTONES] = {};
+	// Smoothed output gain (1/normSum). When a harmonic gates in/out the
+	// normalization changes; slewing it prevents the whole output from stepping.
+	float gainSmooth = 0.f;
 
 	// Display buffers
 	float displayBuffer[DISPLAY_POINTS] = {};
@@ -83,6 +86,11 @@ struct Overtone : Module {
 	float displayHarmonics[NUM_OVERTONES][DISPLAY_POINTS] = {};
 	bool displayDirty = true;
 	bool activeHarmonics[NUM_OVERTONES] = {};
+
+	// Cached gainSmooth alpha (5ms smoothing coefficient). Only depends on
+	// sampleRate — previously computed via std::exp every sample.
+	float cachedSampleRateOvertone = 0.f;
+	float gainSmoothAlpha = 0.f;
 
 	// Mask CV mode
 	bool maskModeBinary = true; // true = binary, false = sweep
@@ -204,9 +212,9 @@ struct Overtone : Module {
 		}
 
 		// Additive synthesis with zero-crossing gating.
-		// Use sine LUT (sfs_lut takes phase in [0,1] = one full period) instead
-		// of std::sin, which dropped the per-sample CPU here from 9 transcendentals
-		// to 9 LUT lookups (~10x faster on MetaModule).
+		// Sine LUT instead of std::sin — 9 LUT lookups per sample replaces 9
+		// transcendentals (~10× faster on MetaModule). sfs_lut::sine takes
+		// phase in [0,1] = one full period and wraps internally.
 		float fundamental = sfs_lut::sine(phase);
 		float out = fundamental;      // amplitude 1.0 for fundamental
 		float normSum = 1.f;           // fundamental contributes 1.0
@@ -214,7 +222,6 @@ struct Overtone : Module {
 
 		for (int h = 0; h < NUM_OVERTONES; h++) {
 			int n = OVERTONE_HARMONIC[h]; // harmonic number 2-9
-			// sfs_lut::sine wraps internally, so phase * n can exceed 1.0 safely.
 			float harmonicSample = OVERTONE_AMP[h] * sfs_lut::sine(phase * (float)n);
 
 			// Check for zero crossing: sign change between previous and current sample
@@ -244,8 +251,19 @@ struct Overtone : Module {
 			lights[INDICATOR_1_LIGHT + i].setBrightness(harmonicActive[i] ? 1.f : 0.f);
 		}
 
-		// Normalize to ±5V
-		out = (out / normSum) * 5.f;
+		// Normalize to ±5V. The harmonics themselves switch at their zero
+		// crossings (above), but normSum still steps when one toggles, which
+		// rescales the rest of the signal — so slew the gain (~5ms) to glide
+		// that amplitude change instead of clicking.
+		// Cache the 5ms smoothing alpha (only depends on sample rate).
+		if (args.sampleRate != cachedSampleRateOvertone) {
+			cachedSampleRateOvertone = args.sampleRate;
+			gainSmoothAlpha = 1.f - std::exp(-args.sampleTime / 0.005f);
+		}
+		float targetGain = 5.f / normSum;
+		if (gainSmooth == 0.f) gainSmooth = targetGain;   // initialize on first sample
+		gainSmooth += (targetGain - gainSmooth) * gainSmoothAlpha;
+		out *= gainSmooth;
 
 		outputs[AUDIO_OUTPUT].setVoltage(clamp(out, -10.f, 10.f));
 	}
@@ -267,8 +285,51 @@ struct Overtone : Module {
 // --- Display drawLayer ---
 
 void OvertoneDisplay::drawLayer(const DrawArgs& args, int layer) {
-	if (layer != 1 || !module) {
+	if (layer != 1) {
 		Widget::drawLayer(args, layer);
+		return;
+	}
+	if (!module) {
+		// Browser-preview: synthesize fundamental + a few harmonics + composite.
+		float w = box.size.x;
+		float h = box.size.y;
+		float midY = h * 0.5f;
+		// Fundamental + active harmonics 2, 3, 4 with decreasing amplitude.
+		auto trace = [&](float ampMul, NVGcolor c, float strokeW, float harmonic) {
+			nvgBeginPath(args.vg);
+			for (int i = 0; i < DISPLAY_POINTS; i++) {
+				float px = (float)i / (float)DISPLAY_POINTS * w;
+				float t = (float)i / (float)DISPLAY_POINTS * 2.f * (float)M_PI;
+				float val = std::sin(t * harmonic) * ampMul;
+				float py = midY - val * midY * 0.9f;
+				if (i == 0) nvgMoveTo(args.vg, px, py);
+				else nvgLineTo(args.vg, px, py);
+			}
+			nvgStrokeColor(args.vg, c); nvgStrokeWidth(args.vg, strokeW); nvgStroke(args.vg);
+		};
+		// Fundamental (faint white)
+		trace(0.6f, nvgRGBA(255, 255, 255, 35), 1.0f, 1.f);
+		// A few harmonic traces, faint colored
+		trace(0.4f, nvgRGBA(100, 180, 255, 60), 1.0f, 2.f);
+		trace(0.3f, nvgRGBA(255, 140, 80, 60), 1.0f, 3.f);
+		trace(0.22f, nvgRGBA(100, 255, 140, 60), 1.0f, 4.f);
+		// Composite: sum of all four
+		nvgBeginPath(args.vg);
+		for (int i = 0; i < DISPLAY_POINTS; i++) {
+			float px = (float)i / (float)DISPLAY_POINTS * w;
+			float t = (float)i / (float)DISPLAY_POINTS * 2.f * (float)M_PI;
+			float val = 0.6f * std::sin(t)
+			          + 0.4f * std::sin(t * 2)
+			          + 0.3f * std::sin(t * 3)
+			          + 0.22f * std::sin(t * 4);
+			val *= 0.55f;   // scale to fit
+			float py = midY - val * midY * 0.9f;
+			if (i == 0) nvgMoveTo(args.vg, px, py);
+			else nvgLineTo(args.vg, px, py);
+		}
+		nvgStrokeColor(args.vg, nvgRGBA(100, 180, 255, 220));
+		nvgStrokeWidth(args.vg, 1.5f);
+		nvgStroke(args.vg);
 		return;
 	}
 
@@ -352,11 +413,6 @@ struct OvertoneWidget : ModuleWidget {
 		setModule(module);
 		setPanel(createPanel(asset::plugin(pluginInstance, "res/overtone.svg")));
 
-		// Screws
-		addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
-		addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
-		addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
-		addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
 		// Waveform display (matches Phase: same Y, same margins from panel edge)
 		OvertoneDisplay* display = new OvertoneDisplay();

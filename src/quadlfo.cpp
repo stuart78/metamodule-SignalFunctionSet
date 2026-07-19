@@ -241,6 +241,15 @@ struct Drift : Module {
 				lorenz[i].x += dx * lorenzDt;
 				lorenz[i].y += dy * lorenzDt;
 				lorenz[i].z += dz * lorenzDt;
+
+				// Safety: if the Euler step ever diverges (huge dt / denormals),
+				// reset this attractor to its seed instead of spewing NaNs.
+				if (!std::isfinite(lorenz[i].x) || !std::isfinite(lorenz[i].y) ||
+				    !std::isfinite(lorenz[i].z) ||
+				    std::abs(lorenz[i].x) > 1e4f || std::abs(lorenz[i].y) > 1e4f ||
+				    std::abs(lorenz[i].z) > 1e4f) {
+					lorenz[i] = LorenzState();
+				}
 			}
 		}
 

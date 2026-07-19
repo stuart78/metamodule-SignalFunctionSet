@@ -1,43 +1,26 @@
 #include "plugin.hpp"
+#include "scales.hpp"
+#include "pulse-width.hpp"
 
 // ─── Scale Tables ────────────────────────────────────────────────────────────
+// Scales come from the shared canonical list (src/scales.hpp) so SCALE CV values
+// are interchangeable across Note, Chance, Muse, Phrase, and MetaFugue. `ScaleInfo`
+// is kept as an alias to the shared struct so the existing DSP (scale.intervals /
+// scale.size) compiles unchanged. Canonical intervals are float (some scales are
+// non-12-TET), so the quantizer/deviation math below works in floats.
+using ScaleInfo = sfs::Scale;
+static const sfs::Scale* const SCALES = sfs::SCALES;
+static const int NUM_SCALES = sfs::NUM_SCALES;
 
-struct ScaleInfo {
-	const int* intervals;
-	int size;
-};
-
-static const int SCALE_MAJOR[]        = {0, 2, 4, 5, 7, 9, 11};
-static const int SCALE_NAT_MINOR[]    = {0, 2, 3, 5, 7, 8, 10};
-static const int SCALE_HARM_MINOR[]   = {0, 2, 3, 5, 7, 8, 11};
-static const int SCALE_MELO_MINOR[]   = {0, 2, 3, 5, 7, 9, 11};
-static const int SCALE_DORIAN[]       = {0, 2, 3, 5, 7, 9, 10};
-static const int SCALE_PHRYGIAN[]     = {0, 1, 3, 5, 7, 8, 10};
-static const int SCALE_LYDIAN[]       = {0, 2, 4, 6, 7, 9, 11};
-static const int SCALE_MIXOLYDIAN[]   = {0, 2, 4, 5, 7, 9, 10};
-static const int SCALE_LOCRIAN[]      = {0, 1, 3, 5, 6, 8, 10};
-static const int SCALE_PENTA_MAJ[]    = {0, 2, 4, 7, 9};
-static const int SCALE_PENTA_MIN[]    = {0, 3, 5, 7, 10};
-static const int SCALE_CHROMATIC[]    = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
-
-static const ScaleInfo SCALES[] = {
-	{SCALE_MAJOR,      7},
-	{SCALE_NAT_MINOR,  7},
-	{SCALE_HARM_MINOR, 7},
-	{SCALE_MELO_MINOR, 7},
-	{SCALE_DORIAN,     7},
-	{SCALE_PHRYGIAN,   7},
-	{SCALE_LYDIAN,     7},
-	{SCALE_MIXOLYDIAN, 7},
-	{SCALE_LOCRIAN,    7},
-	{SCALE_PENTA_MAJ,  5},
-	{SCALE_PENTA_MIN,  5},
-	{SCALE_CHROMATIC, 12},
-};
+// Fugue historically shipped a private 12-scale table in a DIFFERENT order.
+// Old saved patches store SCALE_PARAM as an index into that old order; this maps
+// old index → canonical index so dataFromJson() can migrate them (see below).
+//   old: Major,NatMin,HarmMin,MeloMin,Dorian,Phrygian,Lydian,Mixolydian,Locrian,Penta+,Penta-,Chromatic
+static const int LEGACY_SCALE_REMAP[12] = {1, 2, 12, 17, 8, 9, 10, 11, 18, 3, 4, 0};
 
 static const int NUM_STEPS = 8;
 static const int NUM_VOICES = 3;
-static const int CHROMATIC_SCALE_INDEX = 11;
+static const int CHROMATIC_SCALE_INDEX = 0;   // canonical Chromatic is index 0
 
 // ─── Harmonic Deviation Tier Tables ──────────────────────────────────────────
 
@@ -145,7 +128,9 @@ struct Fugue : Module {
 		WANDER_B_PARAM,
 		WANDER_C_PARAM,
 		RESET_BUTTON_PARAM,
-		GATE_TOGGLE_PARAM_0,   // 24 toggles: step0_A, step0_B, step0_C, step1_A, ...
+		// 24 gate toggles, voice-major: A0,A1,…,A7, B0,B1,…,B7, C0,C1,…,C7.
+		// Index = voice * NUM_STEPS + step.
+		GATE_TOGGLE_PARAM_0,
 		PARAMS_LEN = GATE_TOGGLE_PARAM_0 + NUM_STEPS * NUM_VOICES
 	};
 
@@ -165,14 +150,16 @@ struct Fugue : Module {
 	};
 
 	enum OutputId {
-		CV_A_OUTPUT,
-		CV_B_OUTPUT,
-		CV_C_OUTPUT,
-		GATE_A_OUTPUT,
-		GATE_B_OUTPUT,
-		GATE_C_OUTPUT,
+		// Voice-paired: CV and GATE for the same voice are neighbors.
+		CV_A_OUTPUT, GATE_A_OUTPUT,
+		CV_B_OUTPUT, GATE_B_OUTPUT,
+		CV_C_OUTPUT, GATE_C_OUTPUT,
 		OUTPUTS_LEN
 	};
+
+	// Per-voice output lookups (enums are no longer contiguous-by-type).
+	static constexpr int CV_OUTS[NUM_VOICES]   = {CV_A_OUTPUT,   CV_B_OUTPUT,   CV_C_OUTPUT};
+	static constexpr int GATE_OUTS[NUM_VOICES] = {GATE_A_OUTPUT, GATE_B_OUTPUT, GATE_C_OUTPUT};
 
 	enum LightId {
 		GATE_LIGHT_0,         // 24 gate toggle LEDs
@@ -195,6 +182,7 @@ struct Fugue : Module {
 		float currentVoltage = 0.f;
 		float targetVoltage = 0.f;
 		float slewRate = 0.f;
+		dsp::PulseGenerator gatePulse;   // used in Trigger gate-length mode
 	};
 
 	VoiceState voices[NUM_VOICES];
@@ -202,6 +190,11 @@ struct Fugue : Module {
 	dsp::SchmittTrigger resetButtonTrigger;
 	float faderRangeVolts = 1.f;
 	bool harmonicLock = true;
+	// Gate length as a fraction of the step period (0 = 1ms trigger). Previously
+	// the gate just mirrored the clock's high time, so a trigger clock produced
+	// trigger-width "gates"; this makes a proper musical gate.
+	float gateLength = 0.5f;
+	int pulseWidthIdx = 0;   // encoder-safe trigger-mode gate width (index into sfs::PULSE_WIDTHS)
 
 	// ─── Constructor ─────────────────────────────────────────────────────────
 
@@ -218,11 +211,13 @@ struct Fugue : Module {
 		configSwitch(ROOT_PARAM, 0.f, 11.f, 0.f, "Root Note",
 			{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"});
 
-		// Scale (snapped)
-		configSwitch(SCALE_PARAM, 0.f, 11.f, 0.f, "Scale",
-			{"Major", "Natural Minor", "Harmonic Minor", "Melodic Minor",
-			 "Dorian", "Phrygian", "Lydian", "Mixolydian", "Locrian",
-			 "Penta Major", "Penta Minor", "Chromatic"});
+		// Scale (snapped) — canonical shared list; order matches Note/Chance/Muse/Phrase
+		// so SCALE CV is interchangeable. Default index 1 = Major (Fugue's historical default).
+		{
+			std::vector<std::string> scaleNames;
+			for (int i = 0; i < NUM_SCALES; i++) scaleNames.push_back(sfs::SCALES[i].longName);
+			configSwitch(SCALE_PARAM, 0.f, (float)(NUM_SCALES - 1), 1.f, "Scale", scaleNames);
+		}
 
 		// Steps (snapped)
 		configSwitch(STEPS_PARAM, 1.f, 8.f, 8.f, "Steps",
@@ -239,11 +234,12 @@ struct Fugue : Module {
 		// Reset button (momentary)
 		configParam(RESET_BUTTON_PARAM, 0.f, 1.f, 0.f, "Reset");
 
-		// 24 gate toggle buttons (default: A all on, B and C all off)
+		// 24 gate toggle buttons, voice-major: A all 8 steps first, then B's,
+		// then C's. idx = voice * NUM_STEPS + step.
 		const char* voiceNames[] = {"A", "B", "C"};
-		for (int step = 0; step < NUM_STEPS; step++) {
-			for (int v = 0; v < NUM_VOICES; v++) {
-				int idx = step * NUM_VOICES + v;
+		for (int v = 0; v < NUM_VOICES; v++) {
+			for (int step = 0; step < NUM_STEPS; step++) {
+				int idx = v * NUM_STEPS + step;
 				float defaultVal = (v == 0) ? 1.f : 0.f;
 				configSwitch(GATE_TOGGLE_PARAM_0 + idx, 0.f, 1.f, defaultVal,
 					string::f("Gate %s Step %d", voiceNames[v], step + 1),
@@ -279,6 +275,12 @@ struct Fugue : Module {
 		json_t* rootJ = json_object();
 		json_object_set_new(rootJ, "faderRange", json_real(faderRangeVolts));
 		json_object_set_new(rootJ, "harmonicLock", json_boolean(harmonicLock));
+		json_object_set_new(rootJ, "gateLength", json_real(gateLength));
+		json_object_set_new(rootJ, "pulseWidthIdx", json_integer(pulseWidthIdx));
+		// Marks this patch as using the canonical shared scale order. Its ABSENCE on
+		// load means the patch predates the migration and its SCALE_PARAM index must
+		// be remapped from Fugue's old private order (see dataFromJson).
+		json_object_set_new(rootJ, "scaleCanonical", json_boolean(true));
 		return rootJ;
 	}
 
@@ -287,6 +289,19 @@ struct Fugue : Module {
 		if (j) faderRangeVolts = json_number_value(j);
 		json_t* hlJ = json_object_get(rootJ, "harmonicLock");
 		if (hlJ) harmonicLock = json_boolean_value(hlJ);
+		json_t* glJ = json_object_get(rootJ, "gateLength");
+		if (glJ) gateLength = json_number_value(glJ);
+		json_t* pwJ = json_object_get(rootJ, "pulseWidthIdx");
+		if (pwJ) pulseWidthIdx = clamp((int)json_integer_value(pwJ), 0, sfs::NUM_PULSE_WIDTHS - 1);
+
+		// Patch migration: params are already loaded by the base class before this
+		// runs, so params[SCALE_PARAM] holds the saved index. A pre-canonical patch
+		// (no "scaleCanonical" flag) stored it in Fugue's old 12-scale order — remap
+		// it to the canonical index so the patch keeps its intended scale.
+		if (!json_object_get(rootJ, "scaleCanonical")) {
+			int oldIdx = clamp((int)std::round(params[SCALE_PARAM].getValue()), 0, 11);
+			params[SCALE_PARAM].setValue((float)LEGACY_SCALE_REMAP[oldIdx]);
+		}
 	}
 
 	// ─── Scale Quantization ──────────────────────────────────────────────────
@@ -303,8 +318,8 @@ struct Fugue : Module {
 
 		for (int oct = 0; oct <= maxOctaves; oct++) {
 			for (int d = 0; d < scale.size; d++) {
-				int semitone = oct * 12 + scale.intervals[d];
-				float noteVoltage = (float)semitone / 12.f;
+				float semitone = (float)(oct * 12) + scale.intervals[d];
+				float noteVoltage = semitone / 12.f;
 
 				if (noteVoltage > faderRange + 0.05f) break;
 				if (noteVoltage < -0.05f) continue;
@@ -396,12 +411,13 @@ struct Fugue : Module {
 				if (baseSemiNorm < 0) baseSemiNorm += 12;
 				int baseOctave = (int)std::floor(baseSemiFromRoot / 12.f);
 
+				// Find scale degree closest to baseSemiNorm. Floats are used so
+				// non-12-TET scales (Pelog, Slendro, Harmonic) work too.
 				int baseDegree = 0;
+				float bestDiff = 999.f;
 				for (int d = 0; d < scale.size; d++) {
-					if (scale.intervals[d] == baseSemiNorm) {
-						baseDegree = d;
-						break;
-					}
+					float diff = std::fabs(scale.intervals[d] - (float)baseSemiNorm);
+					if (diff < bestDiff) { bestDiff = diff; baseDegree = d; }
 				}
 
 				// Calculate target degree (up or down)
@@ -469,7 +485,7 @@ struct Fugue : Module {
 		int stepsToNext = 0;
 		for (int i = 1; i <= numSteps; i++) {
 			int checkStep = (voice.currentStep + i) % numSteps;
-			int toggleIdx = checkStep * NUM_VOICES + voiceIdx;
+			int toggleIdx = voiceIdx * NUM_STEPS + checkStep;
 			if (params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f) {
 				stepsToNext = i;
 				break;
@@ -535,7 +551,7 @@ struct Fugue : Module {
 		if (inputs[SCALE_CV_INPUT].isConnected()) {
 			scaleIndex += (int)std::round(inputs[SCALE_CV_INPUT].getVoltage());
 		}
-		scaleIndex = clamp(scaleIndex, 0, 11);
+		scaleIndex = clamp(scaleIndex, 0, NUM_SCALES - 1);
 
 		int numSteps = (int)std::round(params[STEPS_PARAM].getValue());
 
@@ -612,6 +628,11 @@ struct Fugue : Module {
 			}
 		}
 
+		// Gate mode: passthrough (-1) mirrors the clock high time; trigger (0)
+		// emits a 1ms pulse; >0 is a duty-cycle fraction of the step period.
+		bool gatePassthrough = gateLength < -0.5f;
+		bool gateTriggerMode = !gatePassthrough && gateLength <= 0.f;
+
 		// ── Per-voice clock processing ──
 		for (int v = 0; v < NUM_VOICES; v++) {
 			VoiceState& voice = voices[v];
@@ -633,25 +654,42 @@ struct Fugue : Module {
 				}
 
 				onVoiceStepAdvance(v);
+
+				// Trigger gate-length mode: fire a 1ms pulse on the new step.
+				if (gateTriggerMode) {
+					int ti = v * NUM_STEPS + voice.currentStep;
+					if (params[GATE_TOGGLE_PARAM_0 + ti].getValue() > 0.5f)
+						voice.gatePulse.trigger(sfs::pulseWidthSec(pulseWidthIdx));
+				}
 			}
 
 			// ── Slew ──
 			processSlew(v, args.sampleTime);
 
 			// ── CV output ──
-			outputs[CV_A_OUTPUT + v].setVoltage(voice.currentVoltage);
+			outputs[CV_OUTS[v]].setVoltage(voice.currentVoltage);
 
 			// ── Gate output ──
-			int toggleIdx = voice.currentStep * NUM_VOICES + v;
+			// Duty-cycle gate sized to the step period (independent of the clock
+			// pulse width), so a trigger clock still yields a real gate. Trigger
+			// mode (gateLength<=0) emits a fixed 1ms pulse per step instead.
+			int toggleIdx = v * NUM_STEPS + voice.currentStep;
 			bool toggleOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
-			outputs[GATE_A_OUTPUT + v].setVoltage((voice.clockHigh && toggleOn) ? 10.f : 0.f);
+			bool gateHi;
+			if (gatePassthrough)
+				gateHi = toggleOn && voice.clockHigh;          // old clock-follow behavior
+			else if (gateTriggerMode)
+				gateHi = voice.gatePulse.process(args.sampleTime);
+			else
+				gateHi = toggleOn && (voice.clockTimer < gateLength * voice.clockPeriod);
+			outputs[GATE_OUTS[v]].setVoltage(gateHi ? 10.f : 0.f);
 		}
 
 		// ── Update lights ──
-		// Gate toggle LEDs
-		for (int step = 0; step < NUM_STEPS; step++) {
-			for (int v = 0; v < NUM_VOICES; v++) {
-				int idx = step * NUM_VOICES + v;
+		// Gate toggle LEDs (voice-major to match the param layout)
+		for (int v = 0; v < NUM_VOICES; v++) {
+			for (int step = 0; step < NUM_STEPS; step++) {
+				int idx = v * NUM_STEPS + step;
 				float brightness = params[GATE_TOGGLE_PARAM_0 + idx].getValue();
 				// Dim steps beyond active count
 				if (step >= numSteps) brightness *= 0.15f;
@@ -662,7 +700,7 @@ struct Fugue : Module {
 		// Step indicator LEDs (3 rows) — only illuminate when gate toggle is ON
 		for (int step = 0; step < NUM_STEPS; step++) {
 			for (int v = 0; v < NUM_VOICES; v++) {
-				int toggleIdx = step * NUM_VOICES + v;
+				int toggleIdx = v * NUM_STEPS + step;
 				bool gateOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
 				int lightBase = (v == 0) ? STEP_A_LIGHT_0 : (v == 1) ? STEP_B_LIGHT_0 : STEP_C_LIGHT_0;
 				lights[lightBase + step].setBrightness(
@@ -799,17 +837,18 @@ struct FugueWidget : ModuleWidget {
 			addParam(createParamCentered<VCVSlider>(mm2px(Vec(x, faderY)), module, Fugue::FADER_PARAM_0 + i));
 
 			// ── Gate toggle buttons (3 rows, all red) ──
-			int idxA = i * NUM_VOICES + 0;
+			// Voice-major indexing: idx = voice * NUM_STEPS + step (i is step)
+			int idxA = 0 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_A)), module,
 				Fugue::GATE_TOGGLE_PARAM_0 + idxA, Fugue::GATE_LIGHT_0 + idxA));
 
-			int idxB = i * NUM_VOICES + 1;
+			int idxB = 1 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_B)), module,
 				Fugue::GATE_TOGGLE_PARAM_0 + idxB, Fugue::GATE_LIGHT_0 + idxB));
 
-			int idxC = i * NUM_VOICES + 2;
+			int idxC = 2 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_C)), module,
 				Fugue::GATE_TOGGLE_PARAM_0 + idxC, Fugue::GATE_LIGHT_0 + idxC));
@@ -872,6 +911,24 @@ struct FugueWidget : ModuleWidget {
 			&module->harmonicLock));
 
 		menu->addChild(new MenuSeparator);
+		menu->addChild(createMenuLabel("Gate length"));
+		struct GateOpt { const char* name; float val; };
+		static const GateOpt gateOpts[] = {
+			{"Clock passthrough", -1.f},
+			{"Trigger (1ms)", 0.f}, {"25%", 0.25f}, {"50%", 0.5f},
+			{"75%", 0.75f}, {"90%", 0.9f}, {"100% (legato)", 1.f},
+		};
+		for (const GateOpt& o : gateOpts) {
+			float gv = o.val;
+			menu->addChild(createCheckMenuItem(o.name, "",
+				[=]() { return std::fabs(module->gateLength - gv) < 1e-4f; },
+				[=]() { module->gateLength = gv; }));
+		}
+		// Trigger-mode gate width (encoder-safe). Only affects the "Trigger" gate
+		// length; duty-cycle gates already stretch across the step.
+		sfs::addPulseWidthMenu(menu, &module->pulseWidthIdx, "Trigger width");
+
+		menu->addChild(new MenuSeparator);
 		menu->addChild(createMenuItem("Randomize Sequence", "",
 			[=]() {
 				for (int i = 0; i < NUM_STEPS; i++) {
@@ -881,5 +938,13 @@ struct FugueWidget : ModuleWidget {
 		));
 	}
 };
+
+// Out-of-line definitions for the ODR-used static constexpr arrays. Strict
+// C++11 (mingw g++) needs them; clang/libc++ already treats the in-class
+// initializer as the definition, so emitting them there is a redefinition.
+#ifndef __clang__
+constexpr int Fugue::CV_OUTS[];
+constexpr int Fugue::GATE_OUTS[];
+#endif
 
 Model* modelFugue = createModel<Fugue, FugueWidget>("Fugue");

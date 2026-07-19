@@ -1,5 +1,6 @@
 #include "plugin.hpp"
 #include "scales.hpp"
+#include "pulse-width.hpp"
 
 // ─── Scale Tables ────────────────────────────────────────────────────────────
 // Scales come from the shared canonical list (src/scales.hpp) so SCALE CV
@@ -126,25 +127,18 @@ struct MetaFugue : Module {
 		WANDER_B_PARAM,
 		WANDER_C_PARAM,
 		RESET_BUTTON_PARAM,
-		GATE_TOGGLE_PARAM_0,   // 24 toggles: step0_A, step0_B, step0_C, step1_A, ...
+		// 24 gate toggles, voice-major: A0,A1,…,A7, B0,B1,…,B7, C0,C1,…,C7.
+		// Index = voice * NUM_STEPS + step.
+		GATE_TOGGLE_PARAM_0,
 		// ── FugueX (was expander, now inline) ──
-		// These come after the 24 gate toggles. Using FugueX_BASE so the layout
-		// math stays explicit even if NUM_STEPS / NUM_VOICES change.
 		FUGUEX_BASE = GATE_TOGGLE_PARAM_0 + NUM_STEPS * NUM_VOICES,
 		RAND_SEQ_BUTTON_PARAM = FUGUEX_BASE,
 		SAMPLE_HOLD_PARAM,
-		STEPS_X_A_PARAM,
-		STEPS_X_B_PARAM,
-		STEPS_X_C_PARAM,
-		RANGE_X_A_PARAM,
-		RANGE_X_B_PARAM,
-		RANGE_X_C_PARAM,
-		SLEEP_X_A_PARAM,
-		SLEEP_X_B_PARAM,
-		SLEEP_X_C_PARAM,
-		PROB_X_A_PARAM,
-		PROB_X_B_PARAM,
-		PROB_X_C_PARAM,
+		// Per-voice FugueX controls, voice-grouped:
+		// Steps_A, Range_A, Sleep_A, Prob_A, then B's, then C's.
+		STEPS_X_A_PARAM, RANGE_X_A_PARAM, SLEEP_X_A_PARAM, PROB_X_A_PARAM,
+		STEPS_X_B_PARAM, RANGE_X_B_PARAM, SLEEP_X_B_PARAM, PROB_X_B_PARAM,
+		STEPS_X_C_PARAM, RANGE_X_C_PARAM, SLEEP_X_C_PARAM, PROB_X_C_PARAM,
 		PARAMS_LEN
 	};
 
@@ -162,28 +156,18 @@ struct MetaFugue : Module {
 		WANDER_C_INPUT,
 		// ── FugueX inputs (was expander, now inline) ──
 		RAND_SEQ_INPUT,
-		STEPS_X_A_INPUT,
-		STEPS_X_B_INPUT,
-		STEPS_X_C_INPUT,
-		RANGE_X_A_INPUT,
-		RANGE_X_B_INPUT,
-		RANGE_X_C_INPUT,
-		SLEEP_X_A_INPUT,
-		SLEEP_X_B_INPUT,
-		SLEEP_X_C_INPUT,
-		PROB_X_A_INPUT,
-		PROB_X_B_INPUT,
-		PROB_X_C_INPUT,
+		// Per-voice FugueX CVs, voice-grouped.
+		STEPS_X_A_INPUT, RANGE_X_A_INPUT, SLEEP_X_A_INPUT, PROB_X_A_INPUT,
+		STEPS_X_B_INPUT, RANGE_X_B_INPUT, SLEEP_X_B_INPUT, PROB_X_B_INPUT,
+		STEPS_X_C_INPUT, RANGE_X_C_INPUT, SLEEP_X_C_INPUT, PROB_X_C_INPUT,
 		INPUTS_LEN
 	};
 
 	enum OutputId {
-		CV_A_OUTPUT,
-		CV_B_OUTPUT,
-		CV_C_OUTPUT,
-		GATE_A_OUTPUT,
-		GATE_B_OUTPUT,
-		GATE_C_OUTPUT,
+		// Voice-paired: CV and GATE for the same voice are neighbors.
+		CV_A_OUTPUT, GATE_A_OUTPUT,
+		CV_B_OUTPUT, GATE_B_OUTPUT,
+		CV_C_OUTPUT, GATE_C_OUTPUT,
 		// ── FugueX outputs (was expander, now inline) ──
 		MAX_OUTPUT,
 		MID_OUTPUT,
@@ -201,7 +185,10 @@ struct MetaFugue : Module {
 		STEP_B_LIGHT_0 = STEP_A_LIGHT_0 + NUM_STEPS,
 		STEP_C_LIGHT_0 = STEP_B_LIGHT_0 + NUM_STEPS,
 		SAMPLE_HOLD_LIGHT = STEP_C_LIGHT_0 + NUM_STEPS,
-		SLEEP_LED_0,          // 3 amber sleep LEDs
+		// FugueX step indicator matrix: 8 steps × 3 voices red LEDs, indexed
+		// as STEP_LED_X_0 + step * NUM_VOICES + voice
+		STEP_LED_X_0,
+		SLEEP_LED_0 = STEP_LED_X_0 + NUM_STEPS * NUM_VOICES,  // 3 amber sleep LEDs
 		LIGHTS_LEN = SLEEP_LED_0 + NUM_VOICES
 	};
 
@@ -209,6 +196,20 @@ struct MetaFugue : Module {
 	static constexpr int SLEEP_VALUES[10] = {0, 1, 2, 4, 5, 8, 16, 32, 48, 64};
 	static constexpr int NUM_SLEEP_VALUES = 10;
 	static constexpr float RANGE_VALUES[3] = {1.f, 2.f, 5.f};
+
+	// Per-voice lookup arrays — the enums are no longer contiguous in voice
+	// order, so per-voice indexing must use these tables instead of e.g.
+	// CV_A_OUTPUT + v.
+	static constexpr int CV_OUTS[NUM_VOICES]    = {CV_A_OUTPUT,   CV_B_OUTPUT,   CV_C_OUTPUT};
+	static constexpr int GATE_OUTS[NUM_VOICES]  = {GATE_A_OUTPUT, GATE_B_OUTPUT, GATE_C_OUTPUT};
+	static constexpr int STEPS_X_PARAMS[NUM_VOICES] = {STEPS_X_A_PARAM, STEPS_X_B_PARAM, STEPS_X_C_PARAM};
+	static constexpr int RANGE_X_PARAMS[NUM_VOICES] = {RANGE_X_A_PARAM, RANGE_X_B_PARAM, RANGE_X_C_PARAM};
+	static constexpr int SLEEP_X_PARAMS[NUM_VOICES] = {SLEEP_X_A_PARAM, SLEEP_X_B_PARAM, SLEEP_X_C_PARAM};
+	static constexpr int PROB_X_PARAMS[NUM_VOICES]  = {PROB_X_A_PARAM,  PROB_X_B_PARAM,  PROB_X_C_PARAM};
+	static constexpr int STEPS_X_INPUTS[NUM_VOICES] = {STEPS_X_A_INPUT, STEPS_X_B_INPUT, STEPS_X_C_INPUT};
+	static constexpr int RANGE_X_INPUTS[NUM_VOICES] = {RANGE_X_A_INPUT, RANGE_X_B_INPUT, RANGE_X_C_INPUT};
+	static constexpr int SLEEP_X_INPUTS[NUM_VOICES] = {SLEEP_X_A_INPUT, SLEEP_X_B_INPUT, SLEEP_X_C_INPUT};
+	static constexpr int PROB_X_INPUTS[NUM_VOICES]  = {PROB_X_A_INPUT,  PROB_X_B_INPUT,  PROB_X_C_INPUT};
 
 	// ─── Per-voice state ─────────────────────────────────────────────────────
 
@@ -223,6 +224,7 @@ struct MetaFugue : Module {
 		float currentVoltage = 0.f;
 		float targetVoltage = 0.f;
 		float slewRate = 0.f;
+		dsp::PulseGenerator gatePulse;   // used in Trigger gate-length mode
 		// True between Reset and the first clock pulse — makes that first
 		// clock fire step 0 (visually step 1) instead of incrementing past
 		// it to step 1 (visually step 2).
@@ -234,6 +236,11 @@ struct MetaFugue : Module {
 	dsp::SchmittTrigger resetButtonTrigger;
 	float faderRangeVolts = 1.f;
 	bool harmonicLock = true;
+	// Voice gate length as a fraction of the step period (0 = 1ms trigger).
+	// Previously the gate mirrored the clock's high time, so a trigger clock
+	// produced trigger-width gates.
+	float gateLength = 0.5f;
+	int pulseWidthIdx = 0;   // encoder-safe trigger-mode gate width (index into sfs::PULSE_WIDTHS)
 
 	// ─── Expander state ─────────────────────────────────────────────────────
 	int sleepCounter[NUM_VOICES] = {};       // clocks remaining in sleep
@@ -287,11 +294,12 @@ struct MetaFugue : Module {
 		// Reset button (momentary)
 		configParam(RESET_BUTTON_PARAM, 0.f, 1.f, 0.f, "Reset");
 
-		// 24 gate toggle buttons (default: A all on, B and C all off)
+		// 24 gate toggle buttons, voice-major indexing: A all 8 steps first,
+		// then B's, then C's. idx = voice * NUM_STEPS + step.
 		const char* voiceNames[] = {"A", "B", "C"};
-		for (int step = 0; step < NUM_STEPS; step++) {
-			for (int v = 0; v < NUM_VOICES; v++) {
-				int idx = step * NUM_VOICES + v;
+		for (int v = 0; v < NUM_VOICES; v++) {
+			for (int step = 0; step < NUM_STEPS; step++) {
+				int idx = v * NUM_STEPS + step;
 				float defaultVal = 1.f;
 				configSwitch(GATE_TOGGLE_PARAM_0 + idx, 0.f, 1.f, defaultVal,
 					string::f("Gate %s Step %d", voiceNames[v], step + 1),
@@ -326,22 +334,24 @@ struct MetaFugue : Module {
 
 		const char* voiceNamesX[] = {"A", "B", "C"};
 		for (int v = 0; v < NUM_VOICES; v++) {
-			configSwitch(STEPS_X_A_PARAM + v, 1.f, 8.f, 8.f,
+			// Per-voice FugueX params (lookups, since enums are voice-grouped
+			// not contiguous-by-control)
+			configSwitch(STEPS_X_PARAMS[v], 1.f, 8.f, 8.f,
 				string::f("Steps %s", voiceNamesX[v]),
 				{"1", "2", "3", "4", "5", "6", "7", "8"});
-			configSwitch(RANGE_X_A_PARAM + v, 0.f, 2.f, 0.f,
+			configSwitch(RANGE_X_PARAMS[v], 0.f, 2.f, 0.f,
 				string::f("Range %s", voiceNamesX[v]),
 				{"1V", "2V", "5V"});
-			configSwitch(SLEEP_X_A_PARAM + v, 0.f, 9.f, 0.f,
+			configSwitch(SLEEP_X_PARAMS[v], 0.f, 9.f, 0.f,
 				string::f("Sleep %s", voiceNamesX[v]),
 				{"0", "1", "2", "4", "5", "8", "16", "32", "48", "64"});
-			configParam(PROB_X_A_PARAM + v, 0.f, 1.f, 1.f,
+			configParam(PROB_X_PARAMS[v], 0.f, 1.f, 1.f,
 				string::f("Probability %s", voiceNamesX[v]), "%", 0.f, 100.f);
 
-			configInput(STEPS_X_A_INPUT + v, string::f("Steps %s CV", voiceNamesX[v]));
-			configInput(RANGE_X_A_INPUT + v, string::f("Range %s CV", voiceNamesX[v]));
-			configInput(SLEEP_X_A_INPUT + v, string::f("Sleep %s CV", voiceNamesX[v]));
-			configInput(PROB_X_A_INPUT + v, string::f("Probability %s CV", voiceNamesX[v]));
+			configInput(STEPS_X_INPUTS[v], string::f("Steps %s CV", voiceNamesX[v]));
+			configInput(RANGE_X_INPUTS[v], string::f("Range %s CV", voiceNamesX[v]));
+			configInput(SLEEP_X_INPUTS[v], string::f("Sleep %s CV", voiceNamesX[v]));
+			configInput(PROB_X_INPUTS[v], string::f("Probability %s CV", voiceNamesX[v]));
 		}
 		configInput(RAND_SEQ_INPUT, "Randomize Sequence Trigger");
 		configOutput(MAX_OUTPUT, "Max CV");
@@ -368,6 +378,8 @@ struct MetaFugue : Module {
 		json_t* rootJ = json_object();
 		json_object_set_new(rootJ, "faderRange", json_real(faderRangeVolts));
 		json_object_set_new(rootJ, "harmonicLock", json_boolean(harmonicLock));
+		json_object_set_new(rootJ, "gateLength", json_real(gateLength));
+		json_object_set_new(rootJ, "pulseWidthIdx", json_integer(pulseWidthIdx));
 		// Bump on any change to SCALE ordering so dataFromJson can migrate
 		// older saved scaleParam values.
 		json_object_set_new(rootJ, "schemaVersion", json_integer(2));
@@ -379,6 +391,10 @@ struct MetaFugue : Module {
 		if (j) faderRangeVolts = json_number_value(j);
 		json_t* hlJ = json_object_get(rootJ, "harmonicLock");
 		if (hlJ) harmonicLock = json_boolean_value(hlJ);
+		json_t* glJ = json_object_get(rootJ, "gateLength");
+		if (glJ) gateLength = json_number_value(glJ);
+		json_t* pwJ = json_object_get(rootJ, "pulseWidthIdx");
+		if (pwJ) pulseWidthIdx = clamp((int)json_integer_value(pwJ), 0, sfs::NUM_PULSE_WIDTHS - 1);
 
 		// Schema v1 → v2: SCALE ordering changed to match Note. Remap the
 		// saved scale param so the patch sounds the same as before.
@@ -591,7 +607,7 @@ struct MetaFugue : Module {
 		int stepsToNext = 0;
 		for (int i = 1; i <= numSteps; i++) {
 			int checkStep = (voice.currentStep + i) % numSteps;
-			int toggleIdx = checkStep * NUM_VOICES + voiceIdx;
+			int toggleIdx = voiceIdx * NUM_STEPS + checkStep;
 			if (params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f) {
 				stepsToNext = i;
 				break;
@@ -736,27 +752,27 @@ struct MetaFugue : Module {
 		};
 		VoiceOverride voiceOv[NUM_VOICES];
 		for (int v = 0; v < NUM_VOICES; v++) {
-			int steps = (int)std::round(params[STEPS_X_A_PARAM + v].getValue());
-			if (inputs[STEPS_X_A_INPUT + v].isConnected()) {
-				steps += (int)std::round(inputs[STEPS_X_A_INPUT + v].getVoltage());
+			int steps = (int)std::round(params[STEPS_X_PARAMS[v]].getValue());
+			if (inputs[STEPS_X_INPUTS[v]].isConnected()) {
+				steps += (int)std::round(inputs[STEPS_X_INPUTS[v]].getVoltage());
 			}
 			voiceOv[v].stepsOverride = clamp(steps, 1, 8);
 
-			int rangeIdx = (int)std::round(params[RANGE_X_A_PARAM + v].getValue());
-			if (inputs[RANGE_X_A_INPUT + v].isConnected()) {
-				rangeIdx += (int)std::round(inputs[RANGE_X_A_INPUT + v].getVoltage());
+			int rangeIdx = (int)std::round(params[RANGE_X_PARAMS[v]].getValue());
+			if (inputs[RANGE_X_INPUTS[v]].isConnected()) {
+				rangeIdx += (int)std::round(inputs[RANGE_X_INPUTS[v]].getVoltage());
 			}
 			voiceOv[v].rangeOverride = RANGE_VALUES[clamp(rangeIdx, 0, 2)];
 
-			int sleepIdx = (int)std::round(params[SLEEP_X_A_PARAM + v].getValue());
-			if (inputs[SLEEP_X_A_INPUT + v].isConnected()) {
-				sleepIdx += (int)std::round(inputs[SLEEP_X_A_INPUT + v].getVoltage());
+			int sleepIdx = (int)std::round(params[SLEEP_X_PARAMS[v]].getValue());
+			if (inputs[SLEEP_X_INPUTS[v]].isConnected()) {
+				sleepIdx += (int)std::round(inputs[SLEEP_X_INPUTS[v]].getVoltage());
 			}
 			voiceOv[v].sleepDivision = SLEEP_VALUES[clamp(sleepIdx, 0, NUM_SLEEP_VALUES - 1)];
 
-			float prob = params[PROB_X_A_PARAM + v].getValue();
-			if (inputs[PROB_X_A_INPUT + v].isConnected()) {
-				prob += inputs[PROB_X_A_INPUT + v].getVoltage() / 5.f;
+			float prob = params[PROB_X_PARAMS[v]].getValue();
+			if (inputs[PROB_X_INPUTS[v]].isConnected()) {
+				prob += inputs[PROB_X_INPUTS[v]].getVoltage() / 5.f;
 			}
 			voiceOv[v].probability = clamp(prob, 0.f, 1.f);
 		}
@@ -792,6 +808,11 @@ struct MetaFugue : Module {
 		}
 
 		// ── Per-voice clock processing ──
+		// Gate mode: passthrough (-1) mirrors the clock high time; trigger (0)
+		// emits a 1ms pulse; >0 is a duty-cycle fraction of the step period.
+		bool gatePassthrough = gateLength < -0.5f;
+		bool gateTriggerMode = !gatePassthrough && gateLength <= 0.f;
+
 		for (int v = 0; v < NUM_VOICES; v++) {
 			VoiceState& voice = voices[v];
 			float clockVolt = getClockVoltage(v);
@@ -857,7 +878,7 @@ struct MetaFugue : Module {
 			// ── Slew / S&H ──
 			if (sampleHoldEnabled) {
 				// In S&H mode, only update voltage when gate fires
-				int toggleIdx = voice.currentStep * NUM_VOICES + v;
+				int toggleIdx = v * NUM_STEPS + voice.currentStep;
 				bool toggleOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
 				if (clockRose && toggleOn && !sleeping[v] && !probGateSuppress[v]) {
 					voice.currentVoltage = voice.targetVoltage;
@@ -868,22 +889,34 @@ struct MetaFugue : Module {
 			}
 
 			// ── CV output ──
-			outputs[CV_A_OUTPUT + v].setVoltage(voice.currentVoltage);
+			outputs[CV_OUTS[v]].setVoltage(voice.currentVoltage);
 
 			// ── Gate output ──
-			int toggleIdx = voice.currentStep * NUM_VOICES + v;
+			// Duty-cycle gate sized to the step period (independent of clock
+			// pulse width) so a trigger clock still yields a real gate; Trigger
+			// mode (gateLength<=0) emits a fixed 1ms pulse per step.
+			int toggleIdx = v * NUM_STEPS + voice.currentStep;
 			bool toggleOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
-			bool gateActive = voice.clockHigh && toggleOn && !sleeping[v] && !probGateSuppress[v];
-			outputs[GATE_A_OUTPUT + v].setVoltage(gateActive ? 10.f : 0.f);
+			bool stepFires = toggleOn && !sleeping[v] && !probGateSuppress[v];
+			if (clockRose && stepFires && gateTriggerMode)
+				voice.gatePulse.trigger(sfs::pulseWidthSec(pulseWidthIdx));
+			bool gateHi;
+			if (gatePassthrough)
+				gateHi = stepFires && voice.clockHigh;          // old clock-follow behavior
+			else if (gateTriggerMode)
+				gateHi = voice.gatePulse.process(args.sampleTime);
+			else
+				gateHi = stepFires && (voice.clockTimer < gateLength * voice.clockPeriod);
+			outputs[GATE_OUTS[v]].setVoltage(gateHi ? 10.f : 0.f);
 
 			// ── Per-step trigger pulses (FugueX feature) ──
 			// On the clock that fires a gate, pulse the per-step output that
 			// matches the current step. A separate PulseGenerator per voice ×
 			// step holds the 1ms pulse high.
-			if (clockRose && gateActive) {
+			if (clockRose && stepFires) {
 				int step = voice.currentStep;
 				if (step >= 0 && step < NUM_STEPS) {
-					triggerPulses[v][step].trigger(1e-3f);
+					triggerPulses[v][step].trigger(sfs::pulseWidthSec(pulseWidthIdx));
 				}
 			}
 			int gateBase = (v == 0) ? GATE_A_STEP_OUTPUT_0
@@ -908,21 +941,45 @@ struct MetaFugue : Module {
 			outputs[MIN_OUTPUT].setVoltage(minV);
 		}
 
-		// ── Sample-and-hold LED + sleep LEDs (FugueX feature) ──
+		// ── Sample-and-hold LED ──
 		lights[SAMPLE_HOLD_LIGHT].setBrightness(sampleHoldEnabled ? 1.f : 0.f);
+
+		// ── FugueX sleep LEDs (amber) ──
+		// Brightness ramps from a min of 0.15 (start of sleep) up to 1.0 (wake),
+		// so users can see the voice "filling up" toward the wake point.
 		for (int v = 0; v < NUM_VOICES; v++) {
 			float sleepBrightness = 0.f;
 			if (sleeping[v]) {
 				int sleepDiv = voiceOv[v].sleepDivision;
-				sleepBrightness = (sleepDiv > 0) ? ((float)sleepCounter[v] / (float)sleepDiv) : 0.f;
+				float progress = (sleepDiv > 0) ? 1.f - (float)sleepCounter[v] / (float)sleepDiv : 1.f;
+				sleepBrightness = std::max(0.15f, progress);
 			}
 			lights[SLEEP_LED_0 + v].setBrightness(sleepBrightness);
 		}
 
-		// ── Update lights ──
+		// ── FugueX step indicator matrix (8 cols × 3 voices, red) ──
+		// Mirrors original FugueX: lights the current step's cell at 1.0 if
+		// the gate is firing right now, 0.3 if it's the playhead but no gate.
+		// All cells dark while the voice is sleeping.
 		for (int step = 0; step < NUM_STEPS; step++) {
 			for (int v = 0; v < NUM_VOICES; v++) {
-				int idx = step * NUM_VOICES + v;
+				int lightIdx = STEP_LED_X_0 + step * NUM_VOICES + v;
+				if (step == voices[v].currentStep && !sleeping[v]) {
+					int toggleIdx = v * NUM_STEPS + step;
+					bool toggleOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
+					bool gateActive = voices[v].clockHigh && toggleOn && !probGateSuppress[v];
+					lights[lightIdx].setBrightness(gateActive ? 1.f : 0.3f);
+				} else {
+					lights[lightIdx].setBrightness(0.f);
+				}
+			}
+		}
+
+		// ── Update lights ──
+		// Gate-toggle LEDs use the same voice-major layout as the params.
+		for (int v = 0; v < NUM_VOICES; v++) {
+			for (int step = 0; step < NUM_STEPS; step++) {
+				int idx = v * NUM_STEPS + step;
 				float brightness = params[GATE_TOGGLE_PARAM_0 + idx].getValue();
 				if (step >= numSteps) brightness *= 0.15f;
 				lights[GATE_LIGHT_0 + idx].setBrightness(brightness);
@@ -931,7 +988,7 @@ struct MetaFugue : Module {
 
 		for (int step = 0; step < NUM_STEPS; step++) {
 			for (int v = 0; v < NUM_VOICES; v++) {
-				int toggleIdx = step * NUM_VOICES + v;
+				int toggleIdx = v * NUM_STEPS + step;
 				bool gateOn = params[GATE_TOGGLE_PARAM_0 + toggleIdx].getValue() > 0.5f;
 				int lightBase = (v == 0) ? STEP_A_LIGHT_0 : (v == 1) ? STEP_B_LIGHT_0 : STEP_C_LIGHT_0;
 				lights[lightBase + step].setBrightness(
@@ -940,6 +997,24 @@ struct MetaFugue : Module {
 		}
 	}
 };
+
+// Out-of-line definitions for the static constexpr arrays above. Required under
+// C++11/14 (the Rack SDK builds with -std=c++11): each of these is indexed by a
+// runtime value, which odr-uses it, so it needs a namespace-scope definition.
+// Apple clang elides the references, but MinGW gcc (the Windows build) emits
+// them — without these the plugin fails to link on Windows.
+constexpr int   MetaFugue::SLEEP_VALUES[];
+constexpr float MetaFugue::RANGE_VALUES[];
+constexpr int   MetaFugue::CV_OUTS[];
+constexpr int   MetaFugue::GATE_OUTS[];
+constexpr int   MetaFugue::STEPS_X_PARAMS[];
+constexpr int   MetaFugue::RANGE_X_PARAMS[];
+constexpr int   MetaFugue::SLEEP_X_PARAMS[];
+constexpr int   MetaFugue::PROB_X_PARAMS[];
+constexpr int   MetaFugue::STEPS_X_INPUTS[];
+constexpr int   MetaFugue::RANGE_X_INPUTS[];
+constexpr int   MetaFugue::SLEEP_X_INPUTS[];
+constexpr int   MetaFugue::PROB_X_INPUTS[];
 
 // ─── FaderParamQuantity Implementation ───────────────────────────────────────
 
@@ -1063,17 +1138,18 @@ struct MetaFugueWidget : ModuleWidget {
 			addParam(createParamCentered<VCVSlider>(mm2px(Vec(x, faderY)), module, MetaFugue::FADER_PARAM_0 + i));
 
 			// ── Gate toggle buttons (3 rows, all red) ──
-			int idxA = i * NUM_VOICES + 0;
+			// Voice-major indexing: idx = voice * NUM_STEPS + step (i is step)
+			int idxA = 0 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_A)), module,
 				MetaFugue::GATE_TOGGLE_PARAM_0 + idxA, MetaFugue::GATE_LIGHT_0 + idxA));
 
-			int idxB = i * NUM_VOICES + 1;
+			int idxB = 1 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_B)), module,
 				MetaFugue::GATE_TOGGLE_PARAM_0 + idxB, MetaFugue::GATE_LIGHT_0 + idxB));
 
-			int idxC = i * NUM_VOICES + 2;
+			int idxC = 2 * NUM_STEPS + i;
 			addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
 				mm2px(Vec(x, gateRowY_C)), module,
 				MetaFugue::GATE_TOGGLE_PARAM_0 + idxC, MetaFugue::GATE_LIGHT_0 + idxC));
@@ -1110,79 +1186,99 @@ struct MetaFugueWidget : ModuleWidget {
 		}
 
 		// ══════════════════════════════════════════════════════════════════════
-		// FUGUEX SECTION (right of the Fugue panel, x=110+mm)
+		// FUGUEX SECTION
 		// ══════════════════════════════════════════════════════════════════════
-		// The MetaFugue panel is wider than the original Fugue panel to fit
-		// the inlined FugueX controls. Layout: column for randomize + S&H,
-		// then a 4 × 3 grid of per-voice (Steps / Range / Sleep / Prob) knobs
-		// with their CV inputs below, then the Min/Mid/Max outputs and the
-		// 24 per-step gate outputs.
-		const float xRandCol = 110.f;
-		const float xShCol   = 122.f;
-		// Top row (knobs + CV jacks)
-		const float xStepsCol = 110.f;
-		const float xRangeCol = 122.f;
-		const float xSleepCol = 134.f;
-		const float xProbCol  = 146.f;
+		// Mirrors the original FugueX panel layout exactly — each widget is
+		// at the same (x, y) as in fugue-expander.cpp but shifted right by
+		// the Fugue panel width (101.6mm) so it sits in the right half of the
+		// combined MetaFugue panel.
+		const float xOff = 101.6f;
+		const float topRowY = 27.94f;
 
-		// Randomize button + Sample-and-Hold latch (top)
-		addParam(createParamCentered<VCVButton>(mm2px(Vec(xRandCol, 22.9f)), module, MetaFugue::RAND_SEQ_BUTTON_PARAM));
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xRandCol, 33.87f)), module, MetaFugue::RAND_SEQ_INPUT));
-		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<RedLight>>>(
-			mm2px(Vec(xShCol, 22.9f)), module,
+		// LED matrix anchors (mirrored from fugue-expander.cpp)
+		const float ledStartX  = 71.12f;
+		const float ledSpacing = 5.08f;
+		const float ledRowYs[] = {17.78f, 22.86f, 27.94f};  // A, B, C
+
+		// Per-voice param grid X positions (from fugue-expander.cpp)
+		const float stpKnobX = 10.16f;   const float stpCvX = 20.32f;
+		const float rngKnobX = 40.64f;   const float rngCvX = 50.80f;
+		const float slpKnobX = 71.24f;   const float slpCvX = 81.28f;
+		const float prbKnobX = 101.60f;  const float prbCvX = 111.76f;
+
+		const float voiceXA_Y = 45.72f;
+		const float voiceXB_Y = 60.96f;
+		const float voiceXC_Y = 76.20f;
+
+		// Bottom row (per-step gate outputs + min/mid/max)
+		const float gateStartX  = 10.16f;
+		const float gateSpacing = 10.16f;
+		const float gateAY = 96.52f;
+		const float gateBY = 106.68f;
+		const float gateCY = 116.83f;
+		const float minMidMaxX = 111.76f;
+
+		// ── Top row: Random button + jack + S&H toggle ──
+		addParam(createParamCentered<VCVButton>(mm2px(Vec(10.16f + xOff, topRowY)), module, MetaFugue::RAND_SEQ_BUTTON_PARAM));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(20.32f + xOff, topRowY)), module, MetaFugue::RAND_SEQ_INPUT));
+		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<WhiteLight>>>(
+			mm2px(Vec(40.64f + xOff, topRowY)), module,
 			MetaFugue::SAMPLE_HOLD_PARAM, MetaFugue::SAMPLE_HOLD_LIGHT));
 
-		// Per-voice (A, B, C) rows for Steps/Range/Sleep/Prob (knob + CV)
-		const int stepsP[]  = {MetaFugue::STEPS_X_A_PARAM, MetaFugue::STEPS_X_B_PARAM, MetaFugue::STEPS_X_C_PARAM};
-		const int rangeP[]  = {MetaFugue::RANGE_X_A_PARAM, MetaFugue::RANGE_X_B_PARAM, MetaFugue::RANGE_X_C_PARAM};
-		const int sleepP[]  = {MetaFugue::SLEEP_X_A_PARAM, MetaFugue::SLEEP_X_B_PARAM, MetaFugue::SLEEP_X_C_PARAM};
-		const int probP[]   = {MetaFugue::PROB_X_A_PARAM,  MetaFugue::PROB_X_B_PARAM,  MetaFugue::PROB_X_C_PARAM};
-		const int stepsI[]  = {MetaFugue::STEPS_X_A_INPUT, MetaFugue::STEPS_X_B_INPUT, MetaFugue::STEPS_X_C_INPUT};
-		const int rangeI[]  = {MetaFugue::RANGE_X_A_INPUT, MetaFugue::RANGE_X_B_INPUT, MetaFugue::RANGE_X_C_INPUT};
-		const int sleepI[]  = {MetaFugue::SLEEP_X_A_INPUT, MetaFugue::SLEEP_X_B_INPUT, MetaFugue::SLEEP_X_C_INPUT};
-		const int probI[]   = {MetaFugue::PROB_X_A_INPUT,  MetaFugue::PROB_X_B_INPUT,  MetaFugue::PROB_X_C_INPUT};
-		const float voiceYsX[] = {50.f, 70.f, 90.f};       // knob row Y
-		const float voiceCvYsX[] = {61.f, 81.f, 101.f};    // CV jack row Y below
+		// ── LED matrix (8 cols × 3 rows red step indicators) ──
+		for (int step = 0; step < NUM_STEPS; step++) {
+			float x = ledStartX + step * ledSpacing + xOff;
+			for (int v = 0; v < NUM_VOICES; v++) {
+				int lightIdx = MetaFugue::STEP_LED_X_0 + step * NUM_VOICES + v;
+				addChild(createLightCentered<SmallLight<RedLight>>(
+					mm2px(Vec(x, ledRowYs[v])), module, lightIdx));
+			}
+		}
+		// Sleep LEDs (col 9, amber)
+		float sleepLedX = ledStartX + 8 * ledSpacing + xOff; // = 111.76 + xOff
 		for (int v = 0; v < NUM_VOICES; v++) {
-			float y = voiceYsX[v];
-			float yCv = voiceCvYsX[v];
-			addParam(createParamCentered<RoundBlackSnapKnob>(mm2px(Vec(xStepsCol, y)), module, stepsP[v]));
-			addParam(createParamCentered<RoundBlackSnapKnob>(mm2px(Vec(xRangeCol, y)), module, rangeP[v]));
-			addParam(createParamCentered<RoundBlackSnapKnob>(mm2px(Vec(xSleepCol, y)), module, sleepP[v]));
-			addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(xProbCol,  y)), module, probP[v]));
-			addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xStepsCol, yCv)), module, stepsI[v]));
-			addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xRangeCol, yCv)), module, rangeI[v]));
-			addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xSleepCol, yCv)), module, sleepI[v]));
-			addInput(createInputCentered<PJ301MPort>(mm2px(Vec(xProbCol,  yCv)), module, probI[v]));
-			// Sleep indicator LED next to the sleep knob
 			addChild(createLightCentered<SmallLight<YellowLight>>(
-				mm2px(Vec(xSleepCol + 5.f, y - 5.f)), module, MetaFugue::SLEEP_LED_0 + v));
+				mm2px(Vec(sleepLedX, ledRowYs[v])), module, MetaFugue::SLEEP_LED_0 + v));
 		}
 
-		// Min/Mid/Max outputs (bottom-left of the FugueX area)
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xStepsCol, 117.f)), module, MetaFugue::MIN_OUTPUT));
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xRangeCol, 117.f)), module, MetaFugue::MID_OUTPUT));
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(xSleepCol, 117.f)), module, MetaFugue::MAX_OUTPUT));
+		// ── Per-voice parameter grid (knob + CV × 4 cols × 3 voices) ──
+		// Use the per-voice lookup arrays since the enums are voice-grouped.
+		const float voiceXYs[] = {voiceXA_Y, voiceXB_Y, voiceXC_Y};
+		for (int v = 0; v < NUM_VOICES; v++) {
+			float y = voiceXYs[v];
 
-		// Per-step gate outputs: 3 rows × 8 steps to the right
-		const float gateStepX0 = 160.f;
-		const float gateStepSpacing = 8.5f;
-		const float gateStepYsA = voiceA_Y;
-		const float gateStepYsB = voiceB_Y;
-		const float gateStepYsC = voiceC_Y;
-		const float gateStepYsX[] = {gateStepYsA, gateStepYsB, gateStepYsC};
-		const int gateStepBase[] = {
+			addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(stpKnobX + xOff, y)), module, MetaFugue::STEPS_X_PARAMS[v]));
+			addInput(createInputCentered<PJ301MPort>(    mm2px(Vec(stpCvX  + xOff, y)), module, MetaFugue::STEPS_X_INPUTS[v]));
+
+			addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(rngKnobX + xOff, y)), module, MetaFugue::RANGE_X_PARAMS[v]));
+			addInput(createInputCentered<PJ301MPort>(    mm2px(Vec(rngCvX  + xOff, y)), module, MetaFugue::RANGE_X_INPUTS[v]));
+
+			addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(slpKnobX + xOff, y)), module, MetaFugue::SLEEP_X_PARAMS[v]));
+			addInput(createInputCentered<PJ301MPort>(    mm2px(Vec(slpCvX  + xOff, y)), module, MetaFugue::SLEEP_X_INPUTS[v]));
+
+			addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(prbKnobX + xOff, y)), module, MetaFugue::PROB_X_PARAMS[v]));
+			addInput(createInputCentered<PJ301MPort>(    mm2px(Vec(prbCvX  + xOff, y)), module, MetaFugue::PROB_X_INPUTS[v]));
+		}
+
+		// ── Per-step trigger outputs (3 rows × 8 cols) ──
+		const float gateYs[] = {gateAY, gateBY, gateCY};
+		const int gateBaseOuts[] = {
 			MetaFugue::GATE_A_STEP_OUTPUT_0,
 			MetaFugue::GATE_B_STEP_OUTPUT_0,
 			MetaFugue::GATE_C_STEP_OUTPUT_0,
 		};
-		for (int v = 0; v < NUM_VOICES; v++) {
-			for (int s = 0; s < NUM_STEPS; s++) {
+		for (int s = 0; s < NUM_STEPS; s++) {
+			float x = gateStartX + s * gateSpacing + xOff;
+			for (int v = 0; v < NUM_VOICES; v++) {
 				addOutput(createOutputCentered<PJ301MPort>(
-					mm2px(Vec(gateStepX0 + s * gateStepSpacing, gateStepYsX[v])),
-					module, gateStepBase[v] + s));
+					mm2px(Vec(x, gateYs[v])), module, gateBaseOuts[v] + s));
 			}
 		}
+
+		// ── Max / Mid / Min outputs (right of the per-step gates) ──
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(minMidMaxX + xOff, gateAY)), module, MetaFugue::MAX_OUTPUT));
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(minMidMaxX + xOff, gateBY)), module, MetaFugue::MID_OUTPUT));
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(minMidMaxX + xOff, gateCY)), module, MetaFugue::MIN_OUTPUT));
 	}
 
 	// ── Context Menu ──
@@ -1211,6 +1307,24 @@ struct MetaFugueWidget : ModuleWidget {
 			&module->harmonicLock));
 
 		menu->addChild(new MenuSeparator);
+		menu->addChild(createMenuLabel("Gate length"));
+		struct GateOpt { const char* name; float val; };
+		static const GateOpt gateOpts[] = {
+			{"Clock passthrough", -1.f},
+			{"Trigger (1ms)", 0.f}, {"25%", 0.25f}, {"50%", 0.5f},
+			{"75%", 0.75f}, {"90%", 0.9f}, {"100% (legato)", 1.f},
+		};
+		for (const GateOpt& o : gateOpts) {
+			float gv = o.val;
+			menu->addChild(createCheckMenuItem(o.name, "",
+				[=]() { return std::fabs(module->gateLength - gv) < 1e-4f; },
+				[=]() { module->gateLength = gv; }));
+		}
+		// Trigger-mode gate width (encoder-safe). Only affects the "Trigger" gate
+		// length; duty-cycle gates already stretch across the step.
+		sfs::addPulseWidthMenu(menu, &module->pulseWidthIdx, "Trigger width");
+
+		menu->addChild(new MenuSeparator);
 		menu->addChild(createMenuItem("Randomize Sequence", "",
 			[=]() {
 				for (int i = 0; i < NUM_STEPS; i++) {
@@ -1220,6 +1334,11 @@ struct MetaFugueWidget : ModuleWidget {
 		));
 	}
 };
+
+// (MetaFugue is in an anonymous namespace → internal linkage, so g++ emits its
+// static constexpr arrays from the in-class initializers; no out-of-line
+// definitions are needed here. Fugue needs them only because it has external
+// linkage — see fugue.cpp.)
 
 } // namespace
 

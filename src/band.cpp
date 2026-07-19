@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "sfs_lut.hpp"
 #include <cmath>
 #include <functional>
 
@@ -18,16 +19,30 @@ static const int N_BANDS = 4;
 static const float C4_HZ = 261.6256f;   // standard 1V/oct reference (0V = C4)
 
 // RBJ biquad bandpass, constant 0 dB peak gain (transposed direct form II).
+// setBandpass is the hot spot — std::cos + std::sin + several divides — but
+// fc/Q usually don't change between samples. Cache the last (fc, Q, fs) and
+// skip the recomputation when nothing changed (saves ~80% of CPU on this
+// module for typical sustained pitches).
 struct BandpassBiquad {
 	float b0 = 0.f, b1 = 0.f, b2 = 0.f, a1 = 0.f, a2 = 0.f;
 	float z1 = 0.f, z2 = 0.f;
+	float cachedFc = -1.f, cachedQ = -1.f, cachedFs = -1.f;
 	void setBandpass(float fc, float fs, float Q) {
-		float w0 = 2.f * (float) M_PI * fc / fs;
-		float cw = std::cos(w0), sw = std::sin(w0);
+		if (fc == cachedFc && Q == cachedQ && fs == cachedFs) return;
+		cachedFc = fc; cachedQ = Q; cachedFs = fs;
+		// Use the sine LUT — sfs_lut::sine takes a normalized phase in [0,1].
+		// Original used cos(w0) and sin(w0) with w0 = 2π·fc/fs.
+		float phase = fc / fs;          // phase in [0, 0.5] is normal
+		float sw = sfs_lut::sine(phase);
+		float cw = sfs_lut::cosine(phase);
 		float alpha = sw / (2.f * Q);
 		float a0 = 1.f + alpha;
-		b0 = alpha / a0; b1 = 0.f; b2 = -alpha / a0;
-		a1 = (-2.f * cw) / a0; a2 = (1.f - alpha) / a0;
+		float inv_a0 = 1.f / a0;
+		b0 =  alpha * inv_a0;
+		b1 = 0.f;
+		b2 = -alpha * inv_a0;
+		a1 = (-2.f * cw) * inv_a0;
+		a2 = (1.f - alpha) * inv_a0;
 	}
 	float process(float x) {
 		float y = b0 * x + z1;
@@ -87,9 +102,18 @@ struct Band : Module {
 	float dispWidth = 0.15f;
 
 	// Input spectrum analyzer (overlapped FFT of the source audio).
+	// On MetaModule we use a smaller FFT and longer hop to lighten CPU.
+	// Resolution at 1024/48kHz is still ~47Hz which is plenty for the
+	// harmonic display, and autocorrelation interpolation compensates for
+	// pitch-detection accuracy.
+#ifdef METAMODULE
+	static const int FFT_N = 1024;
+	static const int FFT_HOP = FFT_N;   // no overlap → ~47 FFTs/sec
+#else
 	static const int FFT_N = 4096;
-	static const int FFT_BINS = FFT_N / 2;
 	static const int FFT_HOP = FFT_N / 2;
+#endif
+	static const int FFT_BINS = FFT_N / 2;
 	dsp::RealFFT* fft = nullptr;
 	float ring[FFT_N] = {};
 	int   ringW = 0, hopCount = 0;
@@ -97,6 +121,8 @@ struct Band : Module {
 	std::vector<float> acfInput, acf;         // power spectrum / autocorrelation
 	float spectrum[FFT_BINS] = {};            // smoothed magnitudes (for display)
 	float spectrumMax = 1e-6f;
+	// Hann window LUT — precomputed once instead of recalculating cos per sample.
+	std::vector<float> hannWindow;
 
 	~Band() { delete fft; }
 
@@ -127,15 +153,21 @@ struct Band : Module {
 		fftSpec.resize(2 * FFT_N, 0.f);
 		acfInput.resize(2 * FFT_N, 0.f);
 		acf.resize(FFT_N, 0.f);
+		// Precompute Hann window (was calling std::cos per sample per FFT —
+		// that's tens of thousands of cos calls per second on MetaModule).
+		hannWindow.resize(FFT_N);
+		for (int i = 0; i < FFT_N; i++) {
+			hannWindow[i] = 0.5f * (1.f - std::cos(2.f * (float) M_PI * i / (FFT_N - 1)));
+		}
 	}
 
 	// Run an FFT over the most recent FFT_N input samples (Hann windowed) and
 	// fold the magnitudes into the smoothed display spectrum.
 	void computeSpectrum() {
+		// Hann is precomputed; just a multiply per sample.
 		for (int i = 0; i < FFT_N; i++) {
 			int idx = (ringW + i) % FFT_N;
-			float win = 0.5f * (1.f - std::cos(2.f * (float) M_PI * i / (FFT_N - 1)));
-			fftFrame[i] = ring[idx] * win;
+			fftFrame[i] = ring[idx] * hannWindow[i];
 		}
 		fft->rfft(fftFrame.data(), fftSpec.data());
 		// Canonical order: [0]=DC, [1]=Nyquist, [2k],[2k+1]=re,im of bin k.
@@ -198,7 +230,8 @@ struct Band : Module {
 	void process(const ProcessArgs& args) override {
 		float fs = args.sampleRate;
 		// Manual fundamental: standard 1V/oct (0V = C4), matches a normal VCO.
-		float manualF0 = C4_HZ * std::pow(2.f, params[TUNE_PARAM].getValue() + inputs[VOCT_INPUT].getVoltage());
+		// pow2 LUT instead of std::pow for V/Oct.
+		float manualF0 = C4_HZ * sfs_lut::pow2(params[TUNE_PARAM].getValue() + inputs[VOCT_INPUT].getVoltage());
 		// Auto-follow overrides it when enabled and a pitch is detected.
 		float f0 = manualF0;
 		if (followPitch && inputs[AUDIO_INPUT].isConnected() && detValid && detF0 > 1.f)
