@@ -111,3 +111,23 @@ jobs:
           name: "Release: ${{ env.CI_REF_NAME }}"
           files: |
             metamodule-plugins/*.mmplugin
+
+      # Releases published here use the workflow's GITHUB_TOKEN, which does NOT
+      # trigger other workflows (announce-release.yml) — GitHub's recursion
+      # guard. So post the Discord announcement directly from this job.
+      - name: Announce release on Discord
+        if: startsWith(github.ref, 'refs/tags/') && inputs.do_release
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          [ -n "$DISCORD_WEBHOOK" ] || { echo "No DISCORD_WEBHOOK secret; skipping"; exit 0; }
+          curl -sf -H "Content-Type: application/json" -X POST "$DISCORD_WEBHOOK" -d @- <<JSON
+          {
+            "embeds": [{
+              "title": "🔊 MetaModule ${CI_REF_NAME} released",
+              "description": "New Signal Function Set MetaModule plugin build — grab the .mmplugin from the release page.",
+              "url": "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${CI_REF_NAME}",
+              "color": 52479
+            }]
+          }
+          JSON
