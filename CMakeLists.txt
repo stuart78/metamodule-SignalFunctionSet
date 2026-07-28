@@ -13,7 +13,7 @@ endif()
 include(${METAMODULE_SDK_DIR}/plugin.cmake)
 
 project(SignalFunctionSet
-    VERSION 1.4.2
+    VERSION 1.4.3
     DESCRIPTION "Signal Function Set plugin for MetaModule"
     LANGUAGES C CXX ASM
 )

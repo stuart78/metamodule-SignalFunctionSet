@@ -268,6 +268,39 @@
         "Quantizer"
       ],
       "hidden": true
+    },
+    {
+      "slug": "Arrange",
+      "name": "Arrange",
+      "description": "Song-form arrangement sequencer: a linear chain of 8 phrases (bar-length sections), each with its own bar length, root, scale, and BPM. Four per-instrument clock buses (with division and CLOCK/BAR/RESET/EOC outs) drop instruments in and out per phrase. Master BPM/root/scale CV outs drive Meter and Note.",
+      "manualUrl": "https://signalfunctionset.com/projects/arrange/",
+      "tags": [
+        "Sequencer",
+        "Clock modulator",
+        "Random",
+        "Utility"
+      ]
+    },
+    {
+      "slug": "Record",
+      "name": "Record",
+      "description": "Multisample auto-sampler. Drives an external voice with V/oct, gate, and velocity and captures its stereo output across a chosen note range and velocity layers, then writes a folder of WAVs plus an .sfz manifest.",
+      "manualUrl": "https://signalfunctionset.com/projects/record/",
+      "tags": [
+        "Sampler",
+        "Recording",
+        "Utility"
+      ]
+    },
+    {
+      "slug": "Play",
+      "name": "Play",
+      "description": "Polyphonic multisample player. Loads SFZ instruments (including those written by Record) and plays them polyphonically via V/oct, gate, and velocity, with CV instrument selection and stereo output.",
+      "manualUrl": "https://signalfunctionset.com/projects/play/",
+      "tags": [
+        "Sampler",
+        "Polyphonic"
+      ]
     }
   ]
 }
